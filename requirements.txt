@@ -1,0 +1,9 @@
+torch==2.8.0
+transformers==4.57.1
+datasets==4.0.0
+huggingface_hub==0.34.4
+safetensors==0.6.2
+numpy==1.26.4
+tqdm==4.67.1
+typing_extensions==4.12.2
+triton==3.4.0; platform_system == "Linux"
