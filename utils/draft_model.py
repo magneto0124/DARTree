@@ -34,6 +34,25 @@ def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
     return torch.multinomial(probs, num_samples=1).view(bsz, seq_len)
 
 
+def logits_entropy(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
+    """Shannon entropy (nats) of the vocab distribution produced by softmax of
+    the *same logits that feed the sampler*, so the reported distribution
+    matches what is actually sampled.
+
+    * ``temperature >= 1e-5``: logits are divided by ``temperature`` first
+      (mirrors ``sample``), then softmaxed.
+    * greedy (``temperature < 1e-5``): softmax of the raw logits (a greedy
+      sampler would otherwise be a degenerate argmax with zero entropy).
+
+    Shape is preserved except the last (vocab) dimension is summed away.
+    """
+    if temperature >= 1e-5:
+        logits = logits / temperature
+    probs = torch.softmax(logits.float(), dim=-1)
+    logp = torch.log(probs)
+    return -(probs * logp).sum(dim=-1)
+
+
 def cuda_time(device: torch.device | str | int | None = None) -> float:
     """Wall-clock seconds after synchronising the active accelerator.
 
@@ -322,11 +341,18 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         block_size: Optional[int] = None,
         graph_runner=None,
         use_bias: bool = True,
+        record_entropy: bool = False,
         return_dict: bool = False,
     ) -> torch.Tensor | SimpleNamespace:
         """Generate with Domino speculative decoding.
 
         This method supports a single sequence on one GPU.
+
+        When ``record_entropy`` is True (Domino/block_size > 1 only), the target
+        model's full-vocab softmax entropy is recorded at every position of each
+        *accepted draft chain* (the contiguous run of draft tokens the target
+        accepted in a round), printed, and returned under ``.entropy`` /
+        ``.entropy_target``.
         """
         if input_ids.ndim != 2 or input_ids.shape[0] != 1:
             raise ValueError(
@@ -395,6 +421,9 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         draft_prefill = True
         prefix_len = int(self.pure_draft_prefix_len)
 
+        # Target-model entropy (nats) at each position of the accepted chains.
+        entropy_target: list[float] = []
+
         while start < max_length:
             block_output_ids = output_ids[:, start : start + block_size].clone()
             k_draft = block_size if shift_label else block_size - 1
@@ -458,10 +487,8 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                         s_i = gru_hidden.transpose(0, 1)
 
                         bias = self.embed_proj(torch.cat([z_i, s_i], dim=-1))
-                        current_token_id = sample(
-                            base_logits[:, i : i + 1, :] + bias,
-                            temperature,
-                        )
+                        corrected_logits = base_logits[:, i : i + 1, :] + bias
+                        current_token_id = sample(corrected_logits, temperature)
                         verify_ids[:, i + 1 : i + 2] = current_token_id
 
                         if i + 1 < k_draft:
@@ -492,6 +519,23 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 .sum(dim=1)[0]
                 .item()
             )
+            if record_entropy and block_size > 1:
+                # For the accepted draft chain (verify indices 1..acceptance_length),
+                # report the target model's word-distribution entropy at each chain
+                # position.  The target logit slot that accepts draft token d_c
+                # (verify index c) is output.logits[:, c-1].
+                for c in range(1, int(acceptance_length) + 1):
+                    j = c - 1
+                    target_ent = float(
+                        logits_entropy(
+                            output.logits[:, j : j + 1, :], temperature
+                        )[0, 0].item()
+                    )
+                    entropy_target.append(target_ent)
+                    print(
+                        f"[entropy] out_pos={start + c} "
+                        f"chain_index={c} target={target_ent:.4f}"
+                    )
             output_ids[:, start : start + acceptance_length + 1] = verify_ids[
                 :, : acceptance_length + 1
             ]
@@ -533,6 +577,17 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         time_per_output_token = (
             total_decode_time / num_output_tokens if num_output_tokens > 0 else 0.0
         )
+        entropy_summary: dict[str, float] = {}
+        if record_entropy and entropy_target:
+            entropy_summary["mean_target_entropy"] = float(
+                sum(entropy_target) / len(entropy_target)
+            )
+            entropy_summary["n_recorded"] = float(len(entropy_target))
+            print(
+                "[entropy-summary] "
+                f"n={len(entropy_target)} "
+                f"mean target={sum(entropy_target)/len(entropy_target):.4f}"
+            )
         return SimpleNamespace(
             output_ids=output_ids,
             num_input_tokens=num_input_tokens,
@@ -541,4 +596,6 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             time_per_output_token=time_per_output_token,
             acceptance_lengths=acceptance_lengths,
             stage_times=stage_times,
+            entropy=entropy_summary,
+            entropy_target=entropy_target,
         )

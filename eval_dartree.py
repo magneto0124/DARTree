@@ -25,6 +25,7 @@ from utils import (
     DraftCorrectionGraphRunner,
     cuda_time,
     load_and_process_dataset,
+    logits_entropy,
     sample,
 )
 from utils.device_backend import (
@@ -1249,6 +1250,7 @@ def dartree_generate(
     temperature: float,
     stop_token_ids: list[int] | None,
     record_round_trace: bool = False,
+    record_entropy: bool = False,
     verify_buffer_nodes: int = 0,
 ) -> SimpleNamespace:
     if input_ids.ndim != 2 or input_ids.shape[0] != 1:
@@ -1321,6 +1323,8 @@ def dartree_generate(
     tree_heights: list[int] = []
     round_trace: list[dict[str, Any]] = []
     tree_buffers: dict[str, torch.Tensor] = {}
+    # Target entropy (nats) at each accepted draft-chain node, DARTree path.
+    entropy_target: list[float] = []
 
     hidden_collector = SelectedHiddenCollector(
         target, draft_model.target_layer_ids
@@ -1582,6 +1586,24 @@ def dartree_generate(
             device,
         )
         accepted_len = int(len(accepted_indices))
+        if record_entropy and accepted_len > 1:
+            # Accepted draft-chain nodes are accepted_indices[1:].  Node i is a
+            # draft token the target accepted using its logit slot parents[i]
+            # (which predicts the token at node i).  Report the target model's
+            # word-distribution entropy at that slot for each chain position.
+            for k in range(1, accepted_len):
+                node = int(accepted_indices[k])
+                parent = int(parents[node])
+                ent = float(
+                    logits_entropy(
+                        output.logits[:, parent : parent + 1, :], temperature
+                    )[0, 0].item()
+                )
+                entropy_target.append(ent)
+                print(
+                    f"[dartree-entropy] out_pos={start + k} "
+                    f"chain_index={k} tree_node={node} target={ent:.4f}"
+                )
         t_commit_tensor = detail_start(detail_times, device)
         accepted_index_tensor = torch.tensor(
             accepted_indices, dtype=torch.long, device=device
@@ -1710,6 +1732,17 @@ def dartree_generate(
         output_ids.shape[1] - num_input_tokens
     )
     decode_time = cuda_time(device) - decode_start
+    entropy_summary: dict[str, float] = {}
+    if record_entropy and entropy_target:
+        entropy_summary["mean_target_entropy"] = float(
+            sum(entropy_target) / len(entropy_target)
+        )
+        entropy_summary["n_recorded"] = float(len(entropy_target))
+        print(
+            "[dartree-entropy-summary] "
+            f"n={len(entropy_target)} "
+            f"mean target={sum(entropy_target)/len(entropy_target):.4f}"
+        )
     return SimpleNamespace(
         output_ids=output_ids.detach().cpu(),
         num_input_tokens=int(num_input_tokens),
@@ -1735,6 +1768,8 @@ def dartree_generate(
         },
         tree_heights=[int(x) for x in tree_heights],
         round_trace=round_trace,
+        entropy=entropy_summary,
+        entropy_target=entropy_target,
     )
 
 
@@ -1946,6 +1981,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-baselines", action="store_true")
     parser.add_argument(
         "--record-round-trace", action="store_true"
+    )
+    parser.add_argument(
+        "--record-entropy", action="store_true",
+        help=(
+            "Print the TARGET model word-distribution entropy at each accepted "
+            "draft-chain position (DARTree path and Domino chain baseline)."
+        ),
     )
     parser.add_argument(
         "--output",
@@ -2205,6 +2247,7 @@ def main() -> None:
                     temperature=args.temperature,
                     graph_runner=chain_graph_runner,
                     use_bias=True,
+                    record_entropy=args.record_entropy,
                     return_dict=True,
                 )
                 row["domino"] = row_from_response(
@@ -2232,6 +2275,7 @@ def main() -> None:
                 record_round_trace=(
                     args.record_round_trace
                 ),
+                record_entropy=args.record_entropy,
                 verify_buffer_nodes=(
                     1 + int(args.tree_budget)
                 ),

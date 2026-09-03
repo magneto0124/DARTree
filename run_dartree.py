@@ -34,6 +34,13 @@ def main() -> None:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--output")
     parser.add_argument("--record-round-trace", action="store_true")
+    parser.add_argument(
+        "--record-entropy", action="store_true",
+        help=(
+            "Print the TARGET model word-distribution entropy at each accepted "
+            "draft-chain position (DARTree path and Domino chain baseline)."
+        ),
+    )
     args = parser.parse_args()
 
     from eval_dartree import main as evaluate
@@ -76,6 +83,8 @@ def main() -> None:
         ]
     if args.record_round_trace:
         engine_args.append("--record-round-trace")
+    if args.record_entropy:
+        engine_args.append("--record-entropy")
 
     sys.argv = engine_args
     evaluate()
