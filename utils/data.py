@@ -5,7 +5,7 @@ from datasets import Dataset, Features, Sequence, Value, load_dataset
 
 def load_and_process_dataset(data_name: str):
     if data_name == "gsm8k":
-        dataset = load_dataset("openai/gsm8k", "main", split="test")
+        dataset = load_dataset("json", data_files={"test": "/home/l00937960/test.jsonl"}, split="test")
         prompt = (
             "{question}\nPlease reason step by step, and put your final answer "
             "within \\boxed{{}}."
