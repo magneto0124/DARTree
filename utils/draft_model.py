@@ -1,4 +1,3 @@
-import time
 from types import SimpleNamespace
 from typing import Callable, Optional
 
@@ -36,18 +35,16 @@ def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
 
 
 def cuda_time(device: torch.device | str | int | None = None) -> float:
-    if torch.cuda.is_available():
-        if device is None:
-            torch.cuda.synchronize()
-        else:
-            cuda_device = (
-                torch.device(f"cuda:{device}")
-                if isinstance(device, int)
-                else torch.device(device)
-            )
-            if cuda_device.type == "cuda":
-                torch.cuda.synchronize(cuda_device)
-    return time.perf_counter()
+    """Wall-clock seconds after synchronising the active accelerator.
+
+    Kept under the original ``cuda_time`` name for source compatibility, but
+    generalised (see ``utils.device_backend.wall_time``) so it also synchronises
+    an Ascend NPU and therefore yields meaningful timings there.  On CPU it
+    simply returns ``time.perf_counter()``.
+    """
+    from .device_backend import wall_time
+
+    return wall_time(device)
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):

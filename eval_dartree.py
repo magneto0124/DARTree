@@ -27,6 +27,15 @@ from utils import (
     load_and_process_dataset,
     sample,
 )
+from utils.device_backend import (
+    accelerator_available,
+    can_use_cuda_graphs,
+    device_type,
+    is_accelerator_device,
+    seed_all,
+    set_device,
+    synchronize,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -70,7 +79,9 @@ class DARTreeScoreSelectGraph:
         self.dtype = dtype
         self.include_gru = bool(include_gru)
         self.graphs: dict[tuple[int, int, int, torch.dtype], dict[str, Any]] = {}
-        self.enabled = bool(device.type == "cuda" and torch.cuda.is_available())
+        # CUDA-graph capture is NVIDIA-only; on an Ascend NPU the caller falls
+        # back to the eager score/select path (run() returns None).
+        self.enabled = can_use_cuda_graphs(device)
         if self.enabled and warm_pairs is not None:
             for batch_size, selected_count in sorted(set((int(b), int(s)) for b, s in warm_pairs)):
                 if (
@@ -1025,13 +1036,12 @@ def build_dartree_supertree(
     prune_wall_ms = 0.0
     used_gpu_topb = False
     if pruned and node_count > int(budget):
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
+        synchronize(device)
         prune_wall_start = time.perf_counter()
         t_prune = detail_start(detail_times, device)
         supertree_node_count = int(node_count)
         used_gpu_topb = bool(
-            device.type == "cuda" and float(depth_bonus) <= 0.0
+            is_accelerator_device(device) and float(depth_bonus) <= 0.0
         )
         if used_gpu_topb:
             kept_old_indices_t = select_topb_prefix_tree_tensor(
@@ -1947,9 +1957,17 @@ def parse_args() -> argparse.Namespace:
 
 
 def validate_contract(args: argparse.Namespace) -> None:
-    if torch.device(args.device).type != "cuda":
+    device_kind = device_type(args.device)
+    if device_kind not in ("cuda", "npu"):
         raise ValueError(
-            "DARTree requires a CUDA device"
+            "DARTree requires a CUDA (NVIDIA) or Ascend NPU device; "
+            f"got {args.device!r}"
+        )
+    if not accelerator_available(args.device):
+        raise ValueError(
+            f"device {args.device!r} was requested but its backend is "
+            "unavailable (no CUDA-enabled torch build, or no CANN/torch_npu "
+            "install for Ascend)"
         )
     positive_args = {
         "--tree-budget": args.tree_budget,
@@ -1988,11 +2006,10 @@ def main() -> None:
 
     random.seed(0)
     np.random.seed(0)
-    torch.manual_seed(0)
-    torch.cuda.manual_seed_all(0)
+    seed_all(0)
 
     device = torch.device(args.device)
-    torch.cuda.set_device(device)
+    set_device(device)
     target = AutoModelForCausalLM.from_pretrained(
         args.target_model,
         attn_implementation="sdpa",
@@ -2070,7 +2087,7 @@ def main() -> None:
         correction_scorer.update_hidden(
             dummy_token, dummy_hidden
         )
-    torch.cuda.synchronize(device)
+    synchronize(device)
 
     candidate_vocab_size = int(args.candidate_vocab_size)
     expansion_k = min(

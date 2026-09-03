@@ -19,6 +19,34 @@ python -m pip install -r requirements.txt
 
 The code was tested with Python 3.12, PyTorch 2.8.0, Transformers 4.57.1, Triton 3.4.0, CUDA 12.8, and an NVIDIA RTX 6000 Ada GPU.
 
+### Running on Huawei Ascend NPU
+
+The DARTree *algorithm* is device-agnostic; only a few performance kernels were
+NVIDIA-bound (CUDA graphs and inline NVIDIA Triton kernels). These are now routed
+through `utils/device_backend.py` and are **disabled on Ascend**, where the code
+uses equivalent pure-PyTorch eager fallbacks.
+
+To run on Ascend:
+
+1. Install the CANN toolkit and its matching `torch_npu` wheel (do **not** `pip
+   install -r requirements.txt` for the CUDA `torch`/`triton` pins on this host —
+   `torch_npu` bundles its own torch build). See the notes in
+   `requirements.txt`.
+2. Pass `--device npu:0` (or `npu:<idx>`):
+
+   ```bash
+   python run_dartree.py \
+     --target-model Qwen/Qwen3-4B \
+     --draft-model Huang2020/Qwen3-4B-Domino-b16 \
+     --dataset gsm8k \
+     --variant pruned \
+     --temperature 0 \
+     --device npu:0
+   ```
+
+If `torch_npu` is not installed, the code still runs unchanged on NVIDIA by
+selecting a CUDA device (`--device cuda:0`, the default).
+
 ## Evaluation
 
 The following command runs the main **DARTree (pruned)** configuration:

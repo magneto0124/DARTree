@@ -11,6 +11,8 @@ try:
 except ImportError:
     HAS_TRITON = False
 
+from .device_backend import can_use_cuda_graphs, can_use_nvidia_triton
+
 
 def unwrap_correction_mlp(
     embed_proj: nn.Module,
@@ -84,7 +86,12 @@ class DominoCorrectionScorer:
                 and isinstance(list(self.middle.children())[0], nn.SiLU)
             )
         )
-        self._can_triton_fuse = self._middle_is_silu and HAS_TRITON
+        # Triton fusion is NVIDIA-only; fall back to pure PyTorch on NPU/CPU.
+        self._can_triton_fuse = (
+            self._middle_is_silu
+            and HAS_TRITON
+            and can_use_nvidia_triton()
+        )
 
         gru = draft_model.prefix_gru
         assert gru.num_layers == 1 and not gru.bidirectional
@@ -432,8 +439,13 @@ class DraftCorrectionGraphRunner:
                 and isinstance(list(self.middle.children())[0], nn.SiLU)
             )
         )
-        # Enable triton fusion whenever middle is SiLU (bias handled in kernel)
-        self._can_triton_fuse = self._middle_is_silu and HAS_TRITON
+        # Triton fusion is only used on NVIDIA backends; Ascend NPUs run the
+        # pure-PyTorch fallback below.
+        self._can_triton_fuse = (
+            self._middle_is_silu
+            and HAS_TRITON
+            and can_use_nvidia_triton()
+        )
 
         dtype = next(draft_model.parameters()).dtype
 
@@ -503,20 +515,30 @@ class DraftCorrectionGraphRunner:
             device=device,
         )
 
-        # Warmup on side stream
-        s = torch.cuda.Stream()
-        s.wait_stream(torch.cuda.current_stream())
+        # CUDA-graph capture is NVIDIA-only.  On an Ascend NPU (or CPU) the
+        # runner falls back to eagerly re-running the identical _forward_impl
+        # body, so the caller's interface is unchanged.
+        self.use_graph = can_use_cuda_graphs(device)
+        self.graph = None
+        if self.use_graph:
+            # Warmup on side stream
+            s = torch.cuda.Stream()
+            s.wait_stream(torch.cuda.current_stream())
 
-        with torch.inference_mode(), torch.cuda.stream(s):
-            for _ in range(3):
+            with torch.inference_mode(), torch.cuda.stream(s):
+                for _ in range(3):
+                    self._forward_impl()
+
+            torch.cuda.current_stream().wait_stream(s)
+
+            # Capture
+            self.graph = torch.cuda.CUDAGraph()
+            with torch.inference_mode(), torch.cuda.graph(self.graph):
                 self._forward_impl()
-
-        torch.cuda.current_stream().wait_stream(s)
-
-        # Capture
-        self.graph = torch.cuda.CUDAGraph()
-        with torch.inference_mode(), torch.cuda.graph(self.graph):
-            self._forward_impl()
+        else:
+            # Single eager warm-up so lazy modules are initialised up-front.
+            with torch.inference_mode():
+                self._forward_impl()
 
     def _forward_impl(self):
         """
@@ -650,6 +672,9 @@ class DraftCorrectionGraphRunner:
         self.static_parallel_hiddens.copy_(parallel_hiddens)
         self.static_base_logits.copy_(base_logits)
 
-        self.graph.replay()
+        if self.use_graph and self.graph is not None:
+            self.graph.replay()
+        else:
+            self._forward_impl()
 
         return self.static_out.clone()

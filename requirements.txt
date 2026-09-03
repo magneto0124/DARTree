@@ -1,3 +1,7 @@
+# ---------------------------------------------------------------------------
+# NVIDIA (CUDA) reference environment — as reported in the paper.
+# torch / triton here are pinned for a CUDA build on Linux x86_64.
+# ---------------------------------------------------------------------------
 torch==2.8.0
 transformers==4.57.1
 datasets==4.0.0
@@ -7,3 +11,19 @@ numpy==1.26.4
 tqdm==4.67.1
 typing_extensions==4.12.2
 triton==3.4.0; platform_system == "Linux"
+
+# ---------------------------------------------------------------------------
+# Huawei Ascend NPU notes
+# ------------------------
+# On an Ascend machine do NOT install the CUDA torch pin above directly.
+# Instead install the CANN toolkit and its matching torch_npu wheel, which
+# ships its own torch build that registers the "npu" backend:
+#
+#     pip install torch_npu-<version>-cp3xx-cp3xx-linux_<arch>.whl  # from CANN
+#
+# The code only imports torch_npu when it is installed (see
+# utils/device_backend.py), so the NVIDIA path above keeps working unchanged.
+# Ascend runs do NOT use the NVIDIA Triton kernels / CUDA graphs; DARTree falls
+# back to the equivalent pure-PyTorch eager paths automatically. Keep the
+# "triton" line only on NVIDIA hosts — uninstall/omit it on Ascend.
+# ---------------------------------------------------------------------------
