@@ -1101,11 +1101,15 @@ def build_dartree_supertree(
             .cpu()
             .tolist()
         ]
-        all_tokens = [
+        # Node-indexed host metadata: ``all_*[i]`` holds the attribute of tree
+        # node ``i`` (0 = root placeholder, 1..node_count = draft nodes), so
+        # the lists line up with ``select_topb_prefix_tree`` which returns
+        # node indices in ``1..node_count``.
+        all_tokens = [0] + [
             int(x)
             for x in tokens_t[:node_count].detach().cpu().tolist()
         ]
-        all_depths = [
+        all_depths = [0] + [
             int(x)
             for x in depths_t[:node_count].detach().cpu().tolist()
         ]
