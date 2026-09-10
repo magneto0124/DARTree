@@ -10,6 +10,7 @@ from .retrieval import (
     GraftAdjacencyMatrix,
     build_retrieval_template,
     default_level_widths,
+    resolve_graft_retain,
 )
 
 __all__ = [
@@ -22,5 +23,6 @@ __all__ = [
     "default_level_widths",
     "load_and_process_dataset",
     "logits_entropy",
+    "resolve_graft_retain",
     "sample",
 ]

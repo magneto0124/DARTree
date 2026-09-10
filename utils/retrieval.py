@@ -22,6 +22,42 @@ from __future__ import annotations
 import torch
 
 
+def resolve_graft_retain(
+    budget: int, ratio: float, supertree_node_count: int | None = None
+) -> tuple[int, int]:
+    """Split a fixed verification budget between draft and retrieval subtrees.
+
+    This is the V1 fixed-ratio budget bookkeeping: keep ``round(ratio * budget)``
+    draft nodes after Top-B pruning and give the rest to the retrieval subtree, so the
+    total never exceeds ``budget`` (``draft_retain + k_ret == budget``).
+
+    Args:
+        budget: total verification budget ``K_max`` (e.g. ``tree_budget``).
+        ratio: fraction of ``budget`` retained for the draft tree, in ``(0, 1]``.
+        supertree_node_count: number of nodes the supertree actually grew.  When given,
+            ``draft_retain`` is clamped so it never exceeds the available supertree
+            nodes (the frontier may have stopped early).
+
+    Returns:
+        ``(draft_retain, k_ret)`` — the Top-B pruning target and the retrieved-node
+        budget respectively.
+    """
+    budget = int(budget)
+    if budget <= 0:
+        raise ValueError(f"budget must be positive, got {budget}")
+    ratio = float(ratio)
+    if not (0.0 < ratio <= 1.0):
+        raise ValueError(f"ratio must be in (0, 1], got {ratio}")
+
+    draft_retain = max(1, round(ratio * budget))
+    if supertree_node_count is not None:
+        # The supertree may have fewer nodes than requested; never claim more than
+        # exist.  Keep the result >= 1 so the tree always has at least the root path.
+        draft_retain = max(1, min(int(draft_retain), int(supertree_node_count)))
+    k_ret = budget - draft_retain
+    return draft_retain, k_ret
+
+
 class GraftAdjacencyMatrix:
     """GPU-resident top-k successor table ``M`` of shape ``[V, k]``.
 

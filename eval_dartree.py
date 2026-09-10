@@ -26,6 +26,7 @@ from utils import (
     cuda_time,
     load_and_process_dataset,
     logits_entropy,
+    resolve_graft_retain,
     sample,
 )
 from utils.device_backend import (
@@ -611,6 +612,7 @@ def build_dartree_supertree(
     score_select_graph: DARTreeScoreSelectGraph,
     tree_buffers: dict[str, torch.Tensor],
     pruned: bool,
+    retain_budget: int | None = None,
     detail_times: dict[str, float] | None = None,
 ) -> tuple[
     torch.Tensor,
@@ -623,6 +625,15 @@ def build_dartree_supertree(
     """Build a fixed-width or globally pruned DARTree."""
     device = parallel_hiddens.device
     depth_limit = int(base_logits.shape[1])
+    # Graft: the pruning target may be smaller than `budget` (`retain_budget`),
+    # leaving ``budget - retain_budget`` slots for the retrieval subtree.  When
+    # `retain_budget` is None the function keeps its original behaviour (prune to
+    # `budget`), so `fixed`/`pruned` variants are unaffected.
+    prune_target = int(budget) if retain_budget is None else int(retain_budget)
+    if prune_target < 0 or prune_target > int(budget):
+        raise ValueError(
+            f"retain_budget {prune_target} must be within [0, budget={budget}]"
+        )
     if budget <= 0 or depth_limit <= 0:
         return (
             torch.empty(0, dtype=torch.long),
@@ -1036,7 +1047,7 @@ def build_dartree_supertree(
     tree_metadata_on_host = False
     prune_wall_ms = 0.0
     used_gpu_topb = False
-    if pruned and node_count > int(budget):
+    if pruned and node_count > prune_target:
         synchronize(device)
         prune_wall_start = time.perf_counter()
         t_prune = detail_start(detail_times, device)
@@ -1048,7 +1059,7 @@ def build_dartree_supertree(
             kept_old_indices_t = select_topb_prefix_tree_tensor(
                 path_scores_t[: node_count + 1],
                 depths_t[:node_count],
-                int(budget),
+                prune_target,
                 float(depth_bonus),
             )
             selected_parent_old_t = parents_t[kept_old_indices_t]
@@ -1122,12 +1133,12 @@ def build_dartree_supertree(
             kept_old_indices_list = select_topb_prefix_tree(
                 all_parents,
                 prune_scores,
-                int(budget),
+                prune_target,
             )
-        if len(kept_old_indices_list) != int(budget):
+        if len(kept_old_indices_list) != prune_target:
             raise RuntimeError(
                 "Top-B pruning selected "
-                f"{len(kept_old_indices_list)} nodes, expected {budget}"
+                f"{len(kept_old_indices_list)} nodes, expected {prune_target}"
             )
         old_to_new = {0: 0}
         old_to_new.update(
@@ -1148,7 +1159,7 @@ def build_dartree_supertree(
             old_to_new[all_parents[index]]
             for index in kept_old_indices_list
         ]
-        node_count = int(budget)
+        node_count = prune_target
         tree_metadata_on_host = True
         add_elapsed(detail_times, "tree_topb_prune", t_prune, device)
         prune_wall_ms = (time.perf_counter() - prune_wall_start) * 1000.0
@@ -1244,6 +1255,7 @@ def dartree_generate(
     depth_bonus: float,
     variant: str,
     supertree_width: int,
+    graft_ratio: float = 1.0,
     correction_scorer: DominoCorrectionScorer,
     candidate_vocab_size: int,
     score_select_graph: DARTreeScoreSelectGraph,
@@ -1500,6 +1512,13 @@ def dartree_generate(
             stage_times["draft"] += draft_elapsed
 
         tree_start = cuda_time(device)
+        if variant == "graft":
+            prune_target, _ret_budget = resolve_graft_retain(
+                tree_budget, graft_ratio
+            )
+            _retain_budget = prune_target
+        else:
+            _retain_budget = None
         (
             node_token_ids,
             node_depths,
@@ -1523,7 +1542,8 @@ def dartree_generate(
             candidate_tables=candidate_tables,
             score_select_graph=score_select_graph,
             tree_buffers=tree_buffers,
-            pruned=(variant == "pruned"),
+            pruned=(variant in ("pruned", "graft")),
+            retain_budget=_retain_budget,
             detail_times=detail_times,
         )
         tree_build_elapsed = cuda_time(device) - tree_start
@@ -1965,11 +1985,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--variant",
-        choices=["fixed", "pruned"],
+        choices=["fixed", "pruned", "graft"],
         default="pruned",
     )
     parser.add_argument(
         "--supertree-width", type=int, default=12
+    )
+    parser.add_argument(
+        "--graft-ratio", type=float, default=0.6,
+        help=(
+            "Graft variant only: fraction of tree-budget retained as draft nodes "
+            "after Top-B pruning (in (0, 1]); the rest goes to the retrieval subtree."
+        ),
     )
     parser.add_argument(
         "--depth-bonus", type=float
@@ -2024,6 +2051,11 @@ def validate_contract(args: argparse.Namespace) -> None:
         raise ValueError(
             "--candidate-vocab-size must be at least --expansion-k"
         )
+    if args.variant == "graft":
+        if not (0.0 < float(args.graft_ratio) <= 1.0):
+            raise ValueError(
+                "--graft-ratio must be in (0, 1]"
+            )
     if args.depth_bonus is None:
         args.depth_bonus = 0.0 if args.variant == "fixed" else -0.2
     if args.variant == "fixed":
@@ -2034,7 +2066,7 @@ def validate_contract(args: argparse.Namespace) -> None:
     else:
         if float(args.depth_bonus) > 0.0:
             raise ValueError(
-                "pruned DARTree requires a non-positive --depth-bonus"
+                "pruned/graft DARTree requires a non-positive --depth-bonus"
             )
         if args.run_baselines:
             raise ValueError(
@@ -2139,7 +2171,7 @@ def main() -> None:
         supertree_width_schedule(
             k_draft, expansion_k, int(args.supertree_width)
         )
-        if args.variant == "pruned"
+        if args.variant in ("pruned", "graft")
         else None
     )
     construction_budget = (
@@ -2265,6 +2297,7 @@ def main() -> None:
                 depth_bonus=args.depth_bonus,
                 variant=args.variant,
                 supertree_width=args.supertree_width,
+                graft_ratio=args.graft_ratio,
                 correction_scorer=correction_scorer,
                 candidate_vocab_size=args.candidate_vocab_size,
                 score_select_graph=score_select_graph,
