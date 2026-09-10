@@ -23,7 +23,7 @@ def main() -> None:
     # Public Domino checkpoint on Hugging Face.
     parser.add_argument("--draft-model", default="Huang2020/Qwen3-4B-Domino-b16")
     parser.add_argument("--dataset", default="gsm8k")
-    parser.add_argument("--variant", choices=["fixed", "pruned"], default="pruned")
+    parser.add_argument("--variant", choices=["fixed", "pruned", "graft"], default="pruned")
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-samples", type=int)
     parser.add_argument("--max-new-tokens", type=int, default=2048)
@@ -31,6 +31,13 @@ def main() -> None:
     parser.add_argument("--tree-budget", type=int, default=64)
     parser.add_argument("--candidate-k", type=int, default=64)
     parser.add_argument("--supertree-width", type=int, default=12)
+    # Graft (retrieval) knobs, forwarded to eval_dartree.py.
+    parser.add_argument("--retrieval-k", type=int, default=9)
+    parser.add_argument("--prune-checkpoints", default="0,1,5")
+    parser.add_argument("--prune-thresholds", default="0.35,0.25,0.15")
+    parser.add_argument("--stage-draft-fractions", default="0.13,0.4,0.67")
+    parser.add_argument("--min-template-width", type=int, default=1)
+    parser.add_argument("--no-graft-init-from-draft-logits", action="store_true")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--output")
     parser.add_argument("--record-round-trace", action="store_true")
@@ -77,10 +84,23 @@ def main() -> None:
             "--depth-bonus", "0",
             "--run-baselines",
         ]
+    elif args.variant == "graft":
+        engine_args += [
+            "--depth-bonus", "0",
+        ]
     else:
         engine_args += [
             "--depth-bonus", "-0.2",
         ]
+    engine_args += [
+        "--retrieval-k", str(args.retrieval_k),
+        "--prune-checkpoints", args.prune_checkpoints,
+        "--prune-thresholds", args.prune_thresholds,
+        "--stage-draft-fractions", args.stage_draft_fractions,
+        "--min-template-width", str(args.min_template_width),
+    ]
+    if args.no_graft_init_from_draft_logits:
+        engine_args.append("--no-graft-init-from-draft-logits")
     if args.record_round_trace:
         engine_args.append("--record-round-trace")
     if args.record_entropy:

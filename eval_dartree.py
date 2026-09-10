@@ -23,9 +23,13 @@ from utils import (
     DFlashDraftModel,
     DominoCorrectionScorer,
     DraftCorrectionGraphRunner,
+    GraftConfig,
+    RetrievalAdjacencyMatrix,
+    RetrievalTemplate,
     cuda_time,
     load_and_process_dataset,
     logits_entropy,
+    make_decaying_depth_counts,
     sample,
 )
 from utils.device_backend import (
@@ -611,6 +615,8 @@ def build_dartree_supertree(
     score_select_graph: DARTreeScoreSelectGraph,
     tree_buffers: dict[str, torch.Tensor],
     pruned: bool,
+    graft_config: GraftConfig | None = None,
+    retrieval_matrix: RetrievalAdjacencyMatrix | None = None,
     detail_times: dict[str, float] | None = None,
 ) -> tuple[
     torch.Tensor,
@@ -717,11 +723,12 @@ def build_dartree_supertree(
             parent_h0.squeeze(0),
         ).unsqueeze(0)
 
+    use_supertree = bool(pruned or graft_config is not None)
     supertree_widths = (
         supertree_width_schedule(
             depth_limit, expansion_count, supertree_width
         )
-        if pruned
+        if use_supertree
         else []
     )
     max_supertree_width = max(supertree_widths, default=1)
@@ -737,9 +744,30 @@ def build_dartree_supertree(
     supertree_node_count = 0
     supertree_budget = (
         sum(int(width) for width in supertree_widths)
-        if pruned
+        if use_supertree
         else int(budget)
     )
+    # Prune-then-graft state (Graft variant): ``graft_stage`` is the index of
+    # the pruning checkpoint that fired (>= 0), or -1 when no checkpoint
+    # triggered (in which case the tree degenerates to the plain draft tree).
+    graft_stage = -1
+    graft_handled = False
+    b_draft = 0
+    retrieved_valid_count = 0
+    if graft_config is not None:
+        root_stage = graft_config.checkpoint_index(0)
+        if (
+            root_stage >= 0
+            and root_top1_probability < graft_config.thresholds[root_stage]
+        ):
+            # Root stage: confidence at the root itself is already below the
+            # threshold, so cap draft expansion to the stage's draft budget
+            # and release the rest to retrieval.
+            graft_stage = root_stage
+            supertree_budget = min(
+                supertree_budget,
+                graft_config.draft_budget(root_stage, int(budget)),
+            )
     max_nodes = int(supertree_budget) + 1
     hidden_size = int(root_hidden.shape[-1])
     hidden_states = reusable_buffer(
@@ -782,7 +810,7 @@ def build_dartree_supertree(
 
         remaining = int(supertree_budget) - int(node_count)
         remaining_depths = max(1, depth_limit - child_depth + 1)
-        if pruned:
+        if use_supertree:
             quota = int(supertree_widths[child_depth - 1])
         else:
             quota = int(np.ceil(remaining / remaining_depths))
@@ -1033,10 +1061,117 @@ def build_dartree_supertree(
             detail_times, "tree_write", t_write, device
         )
 
+        # Graft: confidence-based pruning checkpoints (paper Sec. 3.1).  The
+        # confidence at depth d is the probability of the highest-scoring
+        # draft path at that depth (Eq. 6); when it drops below the calibrated
+        # threshold, draft expansion stops here and the released budget will
+        # be repopulated with retrieved nodes.
+        if (
+            graft_config is not None
+            and graft_stage < 0
+            and selected_path_scores.numel() > 0
+        ):
+            stage_index = graft_config.checkpoint_index(child_depth)
+            if stage_index >= 0:
+                confidence = float(selected_path_scores.max().exp())
+                if confidence < graft_config.thresholds[stage_index]:
+                    graft_stage = stage_index
+                    break
+
     tree_metadata_on_host = False
     prune_wall_ms = 0.0
     used_gpu_topb = False
-    if pruned and node_count > int(budget):
+    if graft_config is not None and graft_stage >= 0:
+        # ---- prune-then-graft merge (paper Sec. 3.2 / Algorithm 2) ----
+        graft_handled = True
+        synchronize(device)
+        t_graft = detail_start(detail_times, device)
+        supertree_node_count = int(node_count)
+        all_parents = [
+            int(x)
+            for x in parents_t[: node_count + 1]
+            .detach()
+            .cpu()
+            .tolist()
+        ]
+        all_scores = [
+            float(x)
+            for x in path_scores_t[: node_count + 1]
+            .detach()
+            .cpu()
+            .tolist()
+        ]
+        all_tokens = [
+            int(x)
+            for x in tokens_t[:node_count].detach().cpu().tolist()
+        ]
+        all_depths = [
+            int(x)
+            for x in depths_t[:node_count].detach().cpu().tolist()
+        ]
+        if all_parents:
+            all_parents[0] = -1
+        # Keep the top B_draft(A) draft nodes by cumulative path score
+        # (Algorithm 2 line 14); scores are prefix-monotone log-probs.
+        b_draft = max(
+            1,
+            min(
+                int(node_count),
+                graft_config.draft_budget(graft_stage, int(budget)),
+            ),
+        )
+        kept = select_topb_prefix_tree(all_parents, all_scores, b_draft)
+        old_to_new = {0: 0}
+        old_to_new.update(
+            {
+                int(old_index): int(new_index)
+                for new_index, old_index in enumerate(kept, start=1)
+            }
+        )
+        node_token_ids = [all_tokens[index] for index in kept]
+        node_depths = [all_depths[index] for index in kept]
+        parents = [-1] + [
+            old_to_new[all_parents[index]] for index in kept
+        ]
+        # Graft retrieved nodes into the released slots: traverse the
+        # stage-adaptive retrieval template from the root token with batched
+        # GPU gathers (paper Eq. 10/15).  Nodes whose parent row is still
+        # empty in the adjacency matrix are dropped (prefix-closed).
+        b_ret = int(budget) - b_draft
+        retrieved_valid_count = 0
+        if b_ret > 0 and retrieval_matrix is not None:
+            depth_counts = make_decaying_depth_counts(
+                b_ret,
+                depth_limit,
+                min_width=graft_config.min_template_width,
+            )
+            template = RetrievalTemplate(
+                depth_counts, retrieval_matrix.k
+            )
+            t_tokens, t_parents, _t_ranks, t_valid = (
+                template.materialize(root_token_id, retrieval_matrix)
+            )
+            global_map = {0: 0}
+            next_global = b_draft + 1
+            for template_index in range(template.node_count):
+                if not t_valid[template_index]:
+                    global_map[template_index + 1] = None
+                    continue
+                global_id = next_global
+                next_global += 1
+                global_map[template_index + 1] = global_id
+                template_parent = t_parents[template_index]
+                parents.append(global_map[template_parent])
+                node_token_ids.append(t_tokens[template_index])
+                node_depths.append(template.node_depths[template_index])
+                retrieved_valid_count += 1
+        node_count = int(len(node_token_ids))
+        tree_metadata_on_host = True
+        add_elapsed(detail_times, "tree_graft_merge", t_graft, device)
+
+    if (
+        pruned or graft_config is not None
+    ) and not graft_handled and node_count > int(budget):
         synchronize(device)
         prune_wall_start = time.perf_counter()
         t_prune = detail_start(detail_times, device)
@@ -1210,10 +1345,27 @@ def build_dartree_supertree(
         "graph_miss_select_layers": float(graph_miss_select_layers),
         "graph_miss_other_layers": float(graph_miss_other_layers),
         "pruned": 1.0 if pruned else 0.0,
-        "supertree_width": float(max_supertree_width) if pruned else 0.0,
+        "supertree_width": (
+            float(max_supertree_width)
+            if (pruned or graft_config is not None)
+            else 0.0
+        ),
         "supertree_node_count": float(supertree_node_count),
         "prune_wall_ms": float(prune_wall_ms),
         "used_gpu_topb": 1.0 if used_gpu_topb else 0.0,
+        "grafted": 1.0 if graft_handled else 0.0,
+        "graft_stage": (
+            float(graft_stage) if graft_config is not None else -1.0
+        ),
+        "graft_draft_nodes": (
+            float(b_draft) if graft_handled else 0.0
+        ),
+        "graft_retrieved_budget": (
+            float(int(budget) - b_draft) if graft_handled else 0.0
+        ),
+        "graft_retrieved_nodes": (
+            float(retrieved_valid_count) if graft_handled else 0.0
+        ),
     }
     stats.update(
         {
@@ -1251,6 +1403,8 @@ def dartree_generate(
     stop_token_ids: list[int] | None,
     record_round_trace: bool = False,
     record_entropy: bool = False,
+    graft_config: GraftConfig | None = None,
+    retrieval_matrix: RetrievalAdjacencyMatrix | None = None,
     verify_buffer_nodes: int = 0,
 ) -> SimpleNamespace:
     if input_ids.ndim != 2 or input_ids.shape[0] != 1:
@@ -1346,6 +1500,14 @@ def dartree_generate(
     ] = sample(output.logits, temperature)
     target_hidden = hidden_collector.cat()
     time_to_first_token = cuda_time(device) - prefill_start
+    if retrieval_matrix is not None:
+        # Initialize the successor row of the last prompt token (the position
+        # that predicts the first generated token / tree root) from the
+        # target's prefill logits (paper Algorithm 1: update M with prefill
+        # logits).
+        retrieval_matrix.update_from_logits(
+            input_ids[:, -1:], output.logits[:, -1:, :]
+        )
 
     start = num_input_tokens
     acceptance_lengths: list[int] = []
@@ -1424,6 +1586,19 @@ def dartree_generate(
             t_base_head,
             device,
         )
+        if (
+            retrieval_matrix is not None
+            and graft_config is not None
+            and graft_config.init_from_draft_logits
+        ):
+            # Warm the root token's successor row from the target-head logits
+            # produced by the block drafter (available before verification),
+            # so grafting can start from the first round instead of waiting
+            # for the first verification pass to populate the matrix.
+            retrieval_matrix.update_from_logits(
+                round_root_token_id.view(-1),
+                base_logits[:, 0:1, :],
+            )
         t_zproj = detail_start(detail_times, device)
         z_parts = correction_scorer.project_z(
             parallel_hiddens[:, :k_draft, :]
@@ -1524,6 +1699,8 @@ def dartree_generate(
             score_select_graph=score_select_graph,
             tree_buffers=tree_buffers,
             pruned=(variant == "pruned"),
+            graft_config=graft_config,
+            retrieval_matrix=retrieval_matrix,
             detail_times=detail_times,
         )
         tree_build_elapsed = cuda_time(device) - tree_start
@@ -1573,6 +1750,13 @@ def dartree_generate(
         posterior = sample(output.logits, temperature)
         verify_elapsed = cuda_time(device) - verify_start
         stage_times["verify"] += verify_elapsed
+        if retrieval_matrix is not None:
+            # Online update (paper Eq. 12/14): refresh the successor rows of
+            # every verified tree node -- accepted and rejected alike -- from
+            # the target's next-token distributions at those positions.
+            retrieval_matrix.update_from_logits(
+                verify_input_ids[0], output.logits[0]
+            )
 
         commit_start = cuda_time(device)
         t_commit_follow = detail_start(detail_times, device)
@@ -1679,6 +1863,15 @@ def dartree_generate(
                 ),
                 "max_frontier_width": int(
                     tree_stats.get("max_frontier_width", 0)
+                ),
+                "graft_stage": int(
+                    tree_stats.get("graft_stage", -1)
+                ),
+                "graft_draft_nodes": int(
+                    tree_stats.get("graft_draft_nodes", 0)
+                ),
+                "graft_retrieved_nodes": int(
+                    tree_stats.get("graft_retrieved_nodes", 0)
                 ),
                 "draft_elapsed": float(draft_elapsed),
                 "draft_counted": bool(draft_counted),
@@ -1927,6 +2120,22 @@ def row_from_response(
     return row
 
 
+def parse_int_list(text: str) -> list[int]:
+    return [
+        int(part)
+        for part in str(text).split(",")
+        if str(part).strip() != ""
+    ]
+
+
+def parse_float_list(text: str) -> list[float]:
+    return [
+        float(part)
+        for part in str(text).split(",")
+        if str(part).strip() != ""
+    ]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -1965,11 +2174,51 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--variant",
-        choices=["fixed", "pruned"],
+        choices=["fixed", "pruned", "graft"],
         default="pruned",
     )
     parser.add_argument(
         "--supertree-width", type=int, default=12
+    )
+    parser.add_argument(
+        "--retrieval-k", type=int, default=9,
+        help=(
+            "Number of top-K successor tokens kept per row of the GPU-resident "
+            "adjacency matrix (Graft, paper Eq. 9)."
+        ),
+    )
+    parser.add_argument(
+        "--prune-checkpoints", default="0,1,5",
+        help=(
+            "Comma-separated draft depths at which confidence pruning is "
+            "evaluated for the Graft variant (0 = the root itself)."
+        ),
+    )
+    parser.add_argument(
+        "--prune-thresholds", default="0.35,0.25,0.15",
+        help=(
+            "Comma-separated confidence thresholds (one per "
+            "--prune-checkpoints entry)."
+        ),
+    )
+    parser.add_argument(
+        "--stage-draft-fractions", default="0.13,0.4,0.67",
+        help=(
+            "Comma-separated fractions of the verification budget kept as "
+            "draft nodes per pruning stage (the rest is grafted from "
+            "retrieval)."
+        ),
+    )
+    parser.add_argument(
+        "--min-template-width", type=int, default=1,
+        help="Minimum per-depth width of the retrieval template.",
+    )
+    parser.add_argument(
+        "--no-graft-init-from-draft-logits", action="store_true",
+        help=(
+            "Do not warm the root token's successor row from the block "
+            "drafter's target-head logits before verification."
+        ),
     )
     parser.add_argument(
         "--depth-bonus", type=float
@@ -2025,7 +2274,9 @@ def validate_contract(args: argparse.Namespace) -> None:
             "--candidate-vocab-size must be at least --expansion-k"
         )
     if args.depth_bonus is None:
-        args.depth_bonus = 0.0 if args.variant == "fixed" else -0.2
+        args.depth_bonus = (
+            0.0 if args.variant in ("fixed", "graft") else -0.2
+        )
     if args.variant == "fixed":
         if abs(float(args.depth_bonus)) > 1e-12:
             raise ValueError(
@@ -2034,11 +2285,39 @@ def validate_contract(args: argparse.Namespace) -> None:
     else:
         if float(args.depth_bonus) > 0.0:
             raise ValueError(
-                "pruned DARTree requires a non-positive --depth-bonus"
+                f"{args.variant} DARTree requires a non-positive "
+                "--depth-bonus"
             )
         if args.run_baselines:
             raise ValueError(
                 "--run-baselines is only available with --variant fixed"
+            )
+    if args.variant == "graft":
+        if int(args.retrieval_k) <= 0:
+            raise ValueError("--retrieval-k must be positive")
+        if int(args.min_template_width) < 0:
+            raise ValueError("--min-template-width must be non-negative")
+        checkpoints = parse_int_list(args.prune_checkpoints)
+        thresholds = parse_float_list(args.prune_thresholds)
+        fractions = parse_float_list(args.stage_draft_fractions)
+        if not checkpoints:
+            raise ValueError("--prune-checkpoints must not be empty")
+        if len(checkpoints) != len(thresholds) or len(checkpoints) != len(
+            fractions
+        ):
+            raise ValueError(
+                "--prune-checkpoints, --prune-thresholds and "
+                "--stage-draft-fractions must have equal length"
+            )
+        if len(set(checkpoints)) != len(checkpoints):
+            raise ValueError("--prune-checkpoints must be distinct")
+        if any(checkpoint < 0 for checkpoint in checkpoints):
+            raise ValueError("--prune-checkpoints must be non-negative")
+        if any(threshold <= 0.0 for threshold in thresholds):
+            raise ValueError("--prune-thresholds must be positive")
+        if any(not (0.0 < fraction < 1.0) for fraction in fractions):
+            raise ValueError(
+                "--stage-draft-fractions must be in (0, 1)"
             )
 
 
@@ -2139,7 +2418,7 @@ def main() -> None:
         supertree_width_schedule(
             k_draft, expansion_k, int(args.supertree_width)
         )
-        if args.variant == "pruned"
+        if args.variant in ("pruned", "graft")
         else None
     )
     construction_budget = (
@@ -2180,6 +2459,27 @@ def main() -> None:
             warm_pairs=sorted(planned_pairs),
         )
     )
+
+    graft_config = None
+    retrieval_matrix = None
+    if args.variant == "graft":
+        graft_config = GraftConfig(
+            k=int(args.retrieval_k),
+            checkpoints=tuple(parse_int_list(args.prune_checkpoints)),
+            thresholds=tuple(parse_float_list(args.prune_thresholds)),
+            stage_draft_fractions=tuple(
+                parse_float_list(args.stage_draft_fractions)
+            ),
+            min_template_width=int(args.min_template_width),
+            init_from_draft_logits=(
+                not args.no_graft_init_from_draft_logits
+            ),
+        )
+        retrieval_matrix = RetrievalAdjacencyMatrix(
+            vocab_size=int(target.lm_head.weight.shape[0]),
+            k=int(args.retrieval_k),
+            device=device,
+        )
 
     dataset = load_and_process_dataset(args.dataset)
     if args.max_samples is not None:
@@ -2276,6 +2576,8 @@ def main() -> None:
                     args.record_round_trace
                 ),
                 record_entropy=args.record_entropy,
+                graft_config=graft_config,
+                retrieval_matrix=retrieval_matrix,
                 verify_buffer_nodes=(
                     1 + int(args.tree_budget)
                 ),
