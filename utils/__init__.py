@@ -6,12 +6,20 @@ from .draft_model import (
     logits_entropy,
     sample,
 )
+from .retrieval import (
+    GraftAdjacencyMatrix,
+    build_retrieval_template,
+    default_level_widths,
+)
 
 __all__ = [
     "DFlashDraftModel",
     "DominoCorrectionScorer",
     "DraftCorrectionGraphRunner",
+    "GraftAdjacencyMatrix",
+    "build_retrieval_template",
     "cuda_time",
+    "default_level_widths",
     "load_and_process_dataset",
     "logits_entropy",
     "sample",
