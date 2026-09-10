@@ -188,7 +188,7 @@ def test_fusion_invariants_full_matrix():
             50: [200, 201, 202],   # root row
             200: [210, 211, 212],  # retrieved node 1's row
             201: [220, 221, 222],  # retrieved node 2's row
-            211: [230, 231, 232],  # retrieved chain row (token 211)
+            210: [230, 231, 232],  # retrieved chain row (token 210)
         },
     )
     fused_parents, fused_tokens, fused_depths, b_draft, n_ret = (
@@ -227,8 +227,10 @@ def test_fusion_invariants_full_matrix():
 
     # retrieval slice: tokens follow the template walk over the matrix and
     # parents map through the template -> global index remapping
-    assert fused_tokens[4:] == [200, 201, 202, 211, 221, 230]
-    assert fused_parents[4:] == [0, 0, 0, 5, 6, 8]
+    # template nodes: 1=(0,r0) 2=(0,r1) 3=(0,r2) 4=(1,r0) 5=(1,r1) 6=(4,r0)
+    # (j==0 keeps extending the greedy chain: nodes 4 and 6)
+    assert fused_tokens[4:] == [200, 201, 202, 210, 211, 230]
+    assert fused_parents[4:] == [0, 0, 0, 5, 5, 8]
 
 
 def test_fusion_cold_matrix_keeps_draft_only():
