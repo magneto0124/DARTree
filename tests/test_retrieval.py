@@ -48,7 +48,7 @@ def test_update_skips_out_of_range_ids():
 
 def test_uninitialized_rows_return_pad_and_flag_false():
     m = GraftAdjacencyMatrix(vocab_size=6, k=2, device="cpu", pad_token_id=42)
-    got = m.lookup(torch.tensor([0, 1, 2]), torch.tensor([0, 1, 2]))
+    got = m.lookup(torch.tensor([0, 1, 2]), torch.tensor([0, 1, 0]))
     assert got.tolist() == [42, 42, 42]
     assert m.is_ready(torch.tensor([0, 1, 2])).sum().item() == 0
 
