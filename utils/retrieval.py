@@ -186,7 +186,28 @@ class GraftAdjacencyMatrix:
     def state_dict(self) -> dict[str, torch.Tensor]:
         return {"matrix": self.matrix, "initialized": self.initialized}
 
+    def save(self, path) -> None:
+        """Persist ``state_dict()`` to ``path`` via ``torch.save``."""
+        torch.save(self.state_dict(), str(path))
+
     def load_state_dict(self, state: dict[str, torch.Tensor]) -> None:
+        """Load a saved ``state_dict()`` with explicit shape validation.
+
+        The saved matrix must match this instance's ``[vocab_size, k]`` shape
+        (i.e. the same model vocab and ``--graft-k``), otherwise the caller gets
+        a clear ``ValueError`` instead of an opaque ``copy_`` failure.
+        """
+        if state["matrix"].shape != self.matrix.shape:
+            raise ValueError(
+                f"saved matrix shape {tuple(state['matrix'].shape)} != expected "
+                f"{tuple(self.matrix.shape)} (vocab x k mismatch: pass the same "
+                "model and --graft-k as the run that produced the file)"
+            )
+        if state["initialized"].shape != self.initialized.shape:
+            raise ValueError(
+                f"saved readiness mask shape {tuple(state['initialized'].shape)} "
+                f"!= expected {tuple(self.initialized.shape)}"
+            )
         self.matrix.copy_(state["matrix"])
         self.initialized.copy_(state["initialized"])
 

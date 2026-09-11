@@ -2273,6 +2273,23 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--graft-matrix-path", type=str, default=None,
+        help=(
+            "Graft variant only: path to a saved adjacency matrix "
+            "(torch.save of GraftAdjacencyMatrix.state_dict). When given, the "
+            "matrix is initialised from it instead of starting cold; its "
+            "vocab x k shape must match the current model and --graft-k."
+        ),
+    )
+    parser.add_argument(
+        "--graft-matrix-save", type=str, default=None,
+        help=(
+            "Graft variant only: optional path to save the final adjacency "
+            "matrix (after the whole dataset run) for later warm starts via "
+            "--graft-matrix-path."
+        ),
+    )
+    parser.add_argument(
         "--graft-warmup", type=int, default=0,
         help=(
             "Graft variant only: RESERVED placeholder — external-corpus warm-up "
@@ -2377,6 +2394,13 @@ def validate_contract(args: argparse.Namespace) -> None:
                 "--graft-no-prune (Graft(ROOT) comparison) is reserved "
                 "and not implemented yet"
             )
+        if (
+            args.graft_matrix_path is not None
+            and not Path(args.graft_matrix_path).exists()
+        ):
+            raise ValueError(
+                f"--graft-matrix-path does not exist: {args.graft_matrix_path}"
+            )
         # Static rank-coverage check: level-1 retrieval nodes use ranks
         # 0..w1-1 (w1 = min(root_width, k_ret)), each requiring a matrix
         # column; otherwise those nodes are silently dropped at build time.
@@ -2453,6 +2477,16 @@ def main() -> None:
                 else 0
             ),
         )
+        if args.graft_matrix_path is not None:
+            # Warm start: initialise M from a previously saved matrix instead
+            # of starting cold (vocab x k shape is validated by load_state_dict).
+            graft_matrix.load_state_dict(
+                torch.load(args.graft_matrix_path, map_location=device)
+            )
+            print(
+                f"[graft] loaded matrix from {args.graft_matrix_path} "
+                f"({graft_matrix.ready_rows()} rows ready)"
+            )
 
     prefix_len = int(
         getattr(draft_model, "pure_draft_prefix_len", 0)
@@ -2736,6 +2770,14 @@ def main() -> None:
         json.dumps(summary, ensure_ascii=False, indent=2)
     )
     print(f"saved: {out_path}")
+
+    if args.variant == "graft" and args.graft_matrix_save is not None:
+        # Persist the final (cumulative) matrix for a later warm start.
+        graft_matrix.save(args.graft_matrix_save)
+        print(
+            f"[graft] saved matrix to {args.graft_matrix_save} "
+            f"({graft_matrix.ready_rows()} rows ready)"
+        )
 
 
 if __name__ == "__main__":

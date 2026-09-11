@@ -83,6 +83,33 @@ def test_state_dict_roundtrip():
     assert torch.equal(m2.initialized, m.initialized)
 
 
+def test_save_load_file_roundtrip(tmp_path):
+    m = GraftAdjacencyMatrix(vocab_size=16, k=3, device="cpu", pad_token_id=0)
+    ids = torch.tensor([5, 8])
+    logits = torch.zeros(2, 16)
+    logits[0, [7, 2, 9]] = torch.tensor([3.0, 2.0, 1.0])
+    logits[1, [1, 4, 11]] = torch.tensor([3.0, 2.0, 1.0])
+    m.update(ids, logits)
+    path = tmp_path / "matrix.pt"
+    m.save(path)
+    assert path.exists()
+    m2 = GraftAdjacencyMatrix(vocab_size=16, k=3, device="cpu", pad_token_id=0)
+    m2.load_state_dict(torch.load(path, map_location="cpu"))
+    assert torch.equal(m2.matrix, m.matrix)
+    assert torch.equal(m2.initialized, m.initialized)
+    assert m2.ready_rows() == 2
+
+
+def test_load_state_dict_shape_mismatch_raises():
+    m = GraftAdjacencyMatrix(vocab_size=16, k=3, device="cpu")
+    m2 = GraftAdjacencyMatrix(vocab_size=8, k=3, device="cpu")
+    with pytest.raises(ValueError):
+        m2.load_state_dict(m.state_dict())
+    m3 = GraftAdjacencyMatrix(vocab_size=16, k=2, device="cpu")
+    with pytest.raises(ValueError):
+        m3.load_state_dict(m.state_dict())
+
+
 def test_build_retrieval_template_root_children_and_chain():
     widths = [3, 2, 1]
     parents, ranks, depths = build_retrieval_template(widths)

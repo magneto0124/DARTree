@@ -280,7 +280,8 @@ lossless。检索节点被 target 拒绝时同样刷 `M`。
   即论文 `M[x̃_i] = argtop_k(p̃_{i+1})`；lossless（只改候选建议）。
 - [ ] ⚠️ `--graft-warmup`：**预留占位，未实现**。论文 warmup 是**外部语料预填**（~5 rounds
   外部数据喂 `update()` 初始化 `M`），不是用被测数据自身积累（自肥无意义）。参数与 CLI 已留
-  空占位（当前传入无效），待实现外部语料 warmup 时再填充。
+  空占位（当前传入无效）。矩阵持久化（`save`/`load_state_dict` + `--graft-matrix-path`/
+  `--graft-matrix-save`）已就绪，未来若做外部语料 warmup 可直接用它落地。
 - [x] 收尾 a：`default_level_widths` 重写——root 层**优先分配**（`w1 = min(root_width, budget-1)`，
   剩余预算再摊深层），小预算 + 大 `--graft-template-depth` 不再退化为 rank0 单链；
   大预算下 `w1` 仍受 `root_width` 控制（防 Graft(ROOT) 覆辙的意图不变）。
@@ -296,6 +297,10 @@ lossless。检索节点被 target 拒绝时同样刷 `M`。
   均已加（Phase 2/3 期间补齐）；`--graft-warmup` 为占位（未实现，见 Phase 3）。
 - [x] 预留参数已加（占位，使用即抛 `NotImplementedError`）：`--graft-stages`（V2 置信度阶段表）、
   `--graft-no-prune`（Graft(ROOT) 对照）。
+- [x] 矩阵持久化：`GraftAdjacencyMatrix.save(path)`（`torch.save(state_dict)`）与
+  `load_state_dict`（含 vocab×k 形状校验）；CLI `--graft-matrix-path`（warm start：从
+  之前保存的矩阵初始化 M，vocab/k 必须匹配，否则 `ValueError`）与 `--graft-matrix-save`
+  （整个数据集运行结束后保存累计的最终矩阵，供下次 warm start）；`run_dartree.py` 透传。
 - [x] `planned_score_select_pairs` 对 graft variant **无需适配**（已确认）：graft 轮 supertree 扩展
   与 pruned 完全一致（`supertree_widths` + `construction_budget=sum(per_layer_widths)`），graph runner
   预热组合天然覆盖；剪枝/检索合并均不经 GRU 打分，不影响预热。

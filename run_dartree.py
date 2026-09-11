@@ -42,6 +42,8 @@ def main() -> None:
     parser.add_argument("--graft-warmup", type=int, default=0)
     parser.add_argument("--graft-stages", type=str, default=None)
     parser.add_argument("--graft-no-prune", action="store_true")
+    parser.add_argument("--graft-matrix-path", type=str, default=None)
+    parser.add_argument("--graft-matrix-save", type=str, default=None)
     parser.add_argument("--record-round-trace", action="store_true")
     parser.add_argument(
         "--record-entropy", action="store_true",
@@ -112,6 +114,14 @@ def main() -> None:
             engine_args += ["--graft-stages", args.graft_stages]
         if args.graft_no_prune:
             engine_args.append("--graft-no-prune")
+        if args.graft_matrix_path is not None:
+            engine_args += [
+                "--graft-matrix-path", args.graft_matrix_path,
+            ]
+        if args.graft_matrix_save is not None:
+            engine_args += [
+                "--graft-matrix-save", args.graft_matrix_save,
+            ]
 
     sys.argv = engine_args
     evaluate()
