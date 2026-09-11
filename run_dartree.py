@@ -35,7 +35,7 @@ def main() -> None:
     parser.add_argument("--output")
     parser.add_argument("--graft-ratio", type=float, default=0.6)
     parser.add_argument("--graft-k", type=int, default=8)
-    parser.add_argument("--graft-template-depth", type=int)
+    parser.add_argument("--graft-template-depth", type=int, default=16)
     parser.add_argument("--graft-root-width", type=int, default=8)
     parser.add_argument("--graft-dedup", choices=["skip", "redirect"], default="skip")
     parser.add_argument("--graft-insert", choices=["root", "into_slot"], default="root")
