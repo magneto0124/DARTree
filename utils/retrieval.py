@@ -104,6 +104,14 @@ class GraftAdjacencyMatrix:
         Out-of-range ids (``< 0`` or ``>= vocab_size``) are skipped.  Rows requested by
         multiple nodes are overwritten (last node wins), which is the intended semantics
         since the matrix keeps only the most recent top-k evidence per token.
+
+        Tie-breaking: when several vocab positions share the top-k boundary value,
+        ``torch.topk`` picks among them **arbitrarily** (implementation-defined, and
+        not necessarily the smallest index), so a row's contents are only determined
+        up to the tie set.  This is harmless for real decoding (continuous float
+        logits practically never tie exactly) and matches the ``argtop_k`` contract,
+        which is itself multi-valued under ties.  Tests must therefore construct
+        logits with strictly ranked values when asserting exact rows.
         """
         token_ids = token_ids.to(self.device, dtype=torch.long).reshape(-1)
         logits = logits.to(self.device).float().reshape(token_ids.numel(), -1)

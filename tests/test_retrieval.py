@@ -16,16 +16,18 @@ from utils.retrieval import (
 
 def test_update_lookup_roundtrip():
     m = GraftAdjacencyMatrix(vocab_size=16, k=3, device="cpu", pad_token_id=0)
-    # Token 5 -> successors [7, 2, 9]; token 8 -> [1, 1, 4] (ties allowed).
+    # Token 5 -> successors [7, 2, 9]; token 8 -> [1, 4, 11].  All logits are
+    # explicitly ranked (no ties): torch.topk's tie-breaking is NOT guaranteed
+    # to pick the smallest index, so tied rows would make this flaky.
     ids = torch.tensor([5, 8])
     logits = torch.zeros(2, 16)
     logits[0, [7, 2, 9]] = torch.tensor([3.0, 2.0, 1.0])
-    logits[1, [1, 4]] = torch.tensor([3.0, 2.0])
+    logits[1, [1, 4, 11]] = torch.tensor([3.0, 2.0, 1.0])
     m.update(ids, logits)
 
     assert m.matrix[5].tolist() == [7, 2, 9]
-    assert m.matrix[8].tolist() == [1, 1, 4]
-    assert m.lookup(torch.tensor([5, 8]), torch.tensor([0, 2])).tolist() == [7, 4]
+    assert m.matrix[8].tolist() == [1, 4, 11]
+    assert m.lookup(torch.tensor([5, 8]), torch.tensor([0, 2])).tolist() == [7, 11]
     assert m.is_ready(torch.tensor([5, 8, 3])).tolist() == [True, True, False]
     assert m.ready_rows() == 2
 
