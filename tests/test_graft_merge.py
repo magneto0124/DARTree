@@ -135,6 +135,34 @@ def test_build_retrieval_subtree_dropped_parent_kills_subtree():
     assert tree["stats"]["dropped_node_count"] == 2.0
 
 
+def test_build_retrieval_subtree_sibling_dedup_skips_duplicate_token():
+    # Defensive sibling dedup: a hand-built matrix row may contain a duplicate
+    # successor (legit topk rows never do — indices are unique — but loaded or
+    # hand-crafted matrices can).  The second depth-1 slot must skip the token
+    # already taken by its sibling and advance to the next rank.
+    m = GraftAdjacencyMatrix(vocab_size=8, k=3, device="cpu", pad_token_id=0)
+    m.matrix[0] = torch.tensor([1, 1, 4])
+    m.initialized[0] = True
+    parents, ranks, depths = build_retrieval_template([2])
+    tree = build_retrieval_subtree(0, m, (parents, ranks, depths), k_ret=2)
+    assert tree["token_ids"] == [1, 4]
+    assert tree["ranks"] == [0, 2]
+    assert tree["stats"]["rank_shifted_node_count"] == 1.0
+    assert tree["stats"]["dropped_node_count"] == 0.0
+
+
+def test_build_retrieval_subtree_zero_budget_and_empty_template():
+    m = make_matrix(rows={0: [1, 2, 3]})
+    template = build_retrieval_template([2])
+    tree = build_retrieval_subtree(0, m, template, k_ret=0)
+    assert tree["token_ids"] == []
+    assert tree["parents"] == [-1]
+    assert tree["stats"]["retrieved_node_count"] == 0.0
+    tree2 = build_retrieval_subtree(0, m, ([], [], []), k_ret=5)
+    assert tree2["token_ids"] == []
+    assert tree2["parents"] == [-1]
+
+
 def test_graft_hybrid_tree_shared_root_merge():
     draft = {
         "node_token_ids": [1, 5, 7],
@@ -249,6 +277,26 @@ def test_graft_hybrid_tree_kmax_guard_raises():
     ret = build_retrieval_subtree(0, m, (parents, ranks, depths), k_ret=2)
     with pytest.raises(RuntimeError):
         graft_hybrid_tree(draft, ret, k_max=6)
+
+
+def test_graft_hybrid_tree_same_token_different_parent_ok():
+    # A retrieval token may equal a draft token as long as their parents differ
+    # (child_maps is per-parent, so no index collision): draft has 1 -> 7 while
+    # retrieval has 2 -> 7.  Both 7s survive.
+    draft = {
+        "node_token_ids": [1, 5, 7],
+        "node_depths": [1, 1, 2],
+        "parents": [-1, 0, 0, 1],
+    }
+    m = make_matrix(rows={0: [2, 3, 4], 2: [7, 8, 9]})
+    parents, ranks, depths = build_retrieval_template([2, 1])
+    ret = build_retrieval_subtree(0, m, (parents, ranks, depths), k_ret=2)
+    merged = graft_hybrid_tree(draft, ret, k_max=10)
+    assert_valid_tree(merged)
+    assert merged["node_token_ids"] == [1, 5, 7, 2, 7]
+    assert merged["parents"] == [-1, 0, 0, 1, 0, 4]
+    assert merged["node_depths"] == [1, 1, 2, 1, 2]
+    assert merged["stats"]["dedup_skipped_nodes"] == 0.0
 
 
 # ----------------------------------------------------------------------
