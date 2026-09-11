@@ -156,6 +156,12 @@ class GraftAdjacencyMatrix:
             if r < 0 or r >= self.k:
                 raise IndexError(f"rank {r} out of range: matrix has k={self.k} successors")
         rows = self.matrix[parent_token_ids]  # [..., k]
+        # Scalar-rank broadcast: a single rank (int or 0-dim tensor) applies to
+        # every parent.  broadcast_to also guarantees the gather index has the
+        # same number of dims as `rows` (parent [N] + scalar rank -> [N, 1]
+        # index against [N, k] input); an un-broadcastable ranks tensor raises
+        # instead of silently truncating.
+        rank_idx = torch.broadcast_to(rank_idx, parent_token_ids.shape)
         return rows.gather(-1, rank_idx.unsqueeze(-1)).squeeze(-1)
 
     # ------------------------------------------------------------ readiness
