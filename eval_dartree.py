@@ -23,7 +23,12 @@ from utils import (
     DFlashDraftModel,
     DominoCorrectionScorer,
     DraftCorrectionGraphRunner,
+    GraftAdjacencyMatrix,
+    build_retrieval_subtree,
+    build_retrieval_template,
     cuda_time,
+    default_level_widths,
+    graft_hybrid_tree,
     load_and_process_dataset,
     logits_entropy,
     resolve_graft_retain,
@@ -43,7 +48,7 @@ from utils.device_backend import (
 REPO_ROOT = Path(__file__).resolve().parent
 
 
-STAGE_NAMES = ("draft", "tree_build", "tree_setup", "verify", "commit")
+STAGE_NAMES = ("draft", "tree_build", "graft", "tree_setup", "verify", "commit")
 
 
 class DARTreeScoreSelectGraph:
@@ -613,6 +618,7 @@ def build_dartree_supertree(
     tree_buffers: dict[str, torch.Tensor],
     pruned: bool,
     retain_budget: int | None = None,
+    pruned_slots_out: list | None = None,
     detail_times: dict[str, float] | None = None,
 ) -> tuple[
     torch.Tensor,
@@ -1149,6 +1155,34 @@ def build_dartree_supertree(
                 )
             }
         )
+        if pruned_slots_out is not None:
+            # Graft ablation `into_slot`: record every pruned node's released
+            # slot as (kept-parent new index, depth) so retrieval tokens can be
+            # grafted back into the pruned branches' positions later.  Only
+            # filled when requested (ablation); keeps the hot path untouched.
+            kept_set = set(kept_old_indices_list)
+            if used_gpu_topb:
+                # The GPU topb path only kept the kept-nodes metadata; pull the
+                # full supertree parents/depths to compute the pruned slots.
+                full_parents = parents_t[: node_count + 1].detach().cpu().tolist()
+                full_depths = depths_t[:node_count].detach().cpu().tolist()
+                for old_index in range(1, int(node_count) + 1):
+                    if old_index in kept_set:
+                        continue
+                    parent_new = old_to_new.get(int(full_parents[old_index]))
+                    if parent_new is not None:
+                        pruned_slots_out.append(
+                            (int(parent_new), int(full_depths[old_index - 1]))
+                        )
+            else:
+                for old_index in range(1, int(node_count) + 1):
+                    if old_index in kept_set:
+                        continue
+                    parent_new = old_to_new.get(int(all_parents[old_index]))
+                    if parent_new is not None:
+                        pruned_slots_out.append(
+                            (int(parent_new), int(all_depths[old_index]))
+                        )
         node_token_ids = [
             all_tokens[index] for index in kept_old_indices_list
         ]
@@ -1256,6 +1290,11 @@ def dartree_generate(
     variant: str,
     supertree_width: int,
     graft_ratio: float = 1.0,
+    graft_matrix: GraftAdjacencyMatrix | None = None,
+    graft_dedup: str = "skip",
+    graft_insert: str = "root",
+    graft_template_depth: int | None = None,
+    graft_root_width: int = 8,
     correction_scorer: DominoCorrectionScorer,
     candidate_vocab_size: int,
     score_select_graph: DARTreeScoreSelectGraph,
@@ -1512,6 +1551,11 @@ def dartree_generate(
             stage_times["draft"] += draft_elapsed
 
         tree_start = cuda_time(device)
+        pruned_slots: list[tuple[int, int]] | None = None
+        if variant == "graft" and graft_insert == "into_slot":
+            # into_slot ablation needs the released pruned slots from the
+            # supertree pruning step (kept parent + pruned depth per node).
+            pruned_slots = []
         if variant == "graft":
             prune_target, _ret_budget = resolve_graft_retain(
                 tree_budget, graft_ratio
@@ -1544,8 +1588,95 @@ def dartree_generate(
             tree_buffers=tree_buffers,
             pruned=(variant in ("pruned", "graft")),
             retain_budget=_retain_budget,
+            pruned_slots_out=pruned_slots,
             detail_times=detail_times,
         )
+        if variant == "graft" and graft_matrix is not None and _ret_budget > 0:
+            # Phase 2: prune-then-graft.  The draft tree above already holds only
+            # the retained `draft_retain` nodes (Top-B pruned to `_retain_budget`);
+            # the released `_ret_budget` slots are now filled by retrieval nodes
+            # queried from the GPU-resident matrix M.  Two merge strategies:
+            #   root  (default): a root-centered retrieval subtree merged under
+            #          the shared root (the paper's prune-then-graft);
+            #   into_slot (ablation): retrieval tokens grafted into the pruned
+            #          branches' original (parent, depth) slots (Graft(TAIL)-like,
+            #          non-paper, stronger prefix dependency).
+            # verify/commit downstream are untouched in both cases.
+            graft_start = cuda_time(device)
+            if graft_insert == "into_slot":
+                merged_tree = graft_hybrid_tree(
+                    draft_tree={
+                        "node_token_ids": [
+                            int(x) for x in node_token_ids.tolist()
+                        ],
+                        "node_depths": [
+                            int(x) for x in node_depths.tolist()
+                        ],
+                        "parents": parents,
+                    },
+                    retrieval_tree={
+                        "token_ids": [],
+                        "depths": [],
+                        "parents": [-1],
+                        "ranks": [],
+                        "stats": {},
+                    },
+                    k_max=tree_budget,
+                    matrix=graft_matrix,
+                    root_token_id=round_root_token_value,
+                    dedup=graft_dedup,
+                    slots=list(pruned_slots or [])[: _ret_budget],
+                )
+            else:
+                template_depth = (
+                    int(k_draft)
+                    if graft_template_depth is None
+                    else int(graft_template_depth)
+                )
+                template = build_retrieval_template(
+                    default_level_widths(
+                        _ret_budget,
+                        template_depth,
+                        root_width=int(graft_root_width),
+                    )
+                )
+                retrieval_tree = build_retrieval_subtree(
+                    root_token_id=round_root_token_value,
+                    matrix=graft_matrix,
+                    template=template,
+                    k_ret=_ret_budget,
+                )
+                merged_tree = graft_hybrid_tree(
+                    draft_tree={
+                        "node_token_ids": [
+                            int(x) for x in node_token_ids.tolist()
+                        ],
+                        "node_depths": [
+                            int(x) for x in node_depths.tolist()
+                        ],
+                        "parents": parents,
+                    },
+                    retrieval_tree=retrieval_tree,
+                    k_max=tree_budget,
+                    matrix=graft_matrix,
+                    root_token_id=round_root_token_value,
+                    dedup=graft_dedup,
+                )
+            node_token_ids = torch.tensor(
+                merged_tree["node_token_ids"],
+                dtype=torch.long,
+                device=device,
+            )
+            node_depths = torch.tensor(
+                merged_tree["node_depths"],
+                dtype=torch.long,
+                device=device,
+            )
+            parents = merged_tree["parents"]
+            child_maps = merged_tree["child_maps"]
+            visibility_cpu = merged_tree["visibility"]
+            tree_stats.update(merged_tree["stats"])
+            stage_times["graft"] += cuda_time(device) - graft_start
         tree_build_elapsed = cuda_time(device) - tree_start
         stage_times["tree_build"] += tree_build_elapsed
         tree_heights.append(int(tree_stats["tree_height"]))
@@ -1999,6 +2130,49 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--graft-k", type=int, default=8,
+        help=(
+            "Graft variant only: number of top-k successors kept per row of the "
+            "adjacency matrix M (also the max successor rank a retrieval lookup "
+            "may scan)."
+        ),
+    )
+    parser.add_argument(
+        "--graft-template-depth", type=int, default=None,
+        help=(
+            "Graft variant only: max depth of the retrieval template (defaults to "
+            "k_draft, i.e. the block draft positions)."
+        ),
+    )
+    parser.add_argument(
+        "--graft-root-width", type=int, default=8,
+        help=(
+            "Graft variant only: width of the retrieval template's root layer "
+            "(level 1); keeps the root level from being dominated by retrieval."
+        ),
+    )
+    parser.add_argument(
+        "--graft-dedup", choices=["skip", "redirect"], default="skip",
+        help=(
+            "Graft variant only: how to handle a retrieved token that duplicates "
+            "an existing child of the same merged parent. 'skip' (default, plan "
+            "方案 A) re-scans successor ranks and otherwise drops the node and its "
+            "subtree; 'redirect' (方案 B) attaches the node's descendants under the "
+            "existing child."
+        ),
+    )
+    parser.add_argument(
+        "--graft-insert", choices=["root", "into_slot"], default="root",
+        help=(
+            "Graft variant only: where the retrieval budget goes. 'root' "
+            "(default, the paper's prune-then-graft) merges a root-centered "
+            "retrieval subtree under the shared root; 'into_slot' (ablation, "
+            "non-paper) grafts retrieval tokens into the pruned branches' "
+            "original (parent, depth) slots — a Graft(TAIL)-like variant with "
+            "stronger prefix dependency."
+        ),
+    )
+    parser.add_argument(
         "--depth-bonus", type=float
     )
     parser.add_argument(
@@ -2056,6 +2230,17 @@ def validate_contract(args: argparse.Namespace) -> None:
             raise ValueError(
                 "--graft-ratio must be in (0, 1]"
             )
+        if int(args.graft_k) <= 0:
+            raise ValueError("--graft-k must be positive")
+        if int(args.graft_root_width) <= 0:
+            raise ValueError("--graft-root-width must be positive")
+        if (
+            args.graft_template_depth is not None
+            and int(args.graft_template_depth) <= 0
+        ):
+            raise ValueError(
+                "--graft-template-depth must be positive when set"
+            )
     if args.depth_bonus is None:
         args.depth_bonus = 0.0 if args.variant == "fixed" else -0.2
     if args.variant == "fixed":
@@ -2101,6 +2286,23 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(
         args.target_model
     )
+
+    graft_matrix = None
+    if args.variant == "graft":
+        # Phase 2: the GPU-resident adjacency matrix M is instantiated here and
+        # consumed by dartree_generate for retrieval grafting.  Without any
+        # online update (Phase 3) its rows stay uninitialised and retrieval
+        # degrades gracefully to an empty subtree (graft == pruned).
+        graft_matrix = GraftAdjacencyMatrix(
+            vocab_size=int(target.lm_head.weight.shape[0]),
+            k=int(args.graft_k),
+            device=device,
+            pad_token_id=(
+                int(tokenizer.pad_token_id)
+                if tokenizer.pad_token_id is not None
+                else 0
+            ),
+        )
 
     prefix_len = int(
         getattr(draft_model, "pure_draft_prefix_len", 0)
@@ -2298,6 +2500,11 @@ def main() -> None:
                 variant=args.variant,
                 supertree_width=args.supertree_width,
                 graft_ratio=args.graft_ratio,
+                graft_matrix=graft_matrix,
+                graft_dedup=args.graft_dedup,
+                graft_insert=args.graft_insert,
+                graft_template_depth=args.graft_template_depth,
+                graft_root_width=args.graft_root_width,
                 correction_scorer=correction_scorer,
                 candidate_vocab_size=args.candidate_vocab_size,
                 score_select_graph=score_select_graph,

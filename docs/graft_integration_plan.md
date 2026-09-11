@@ -243,16 +243,34 @@ lossless。检索节点被 target 拒绝时同样刷 `M`。
 - [ ] ⚠️ 待办：graft 目前只完成了「按 ratio 剪枝」，检索嫁接部分（Phase 2）尚未接，
   故 graft variant 还不能产生正确输出（剪枝后未补检索，只是预算缩小）。
 
-### Phase 2 — 检索嫁接 + 合并（retrieval grafting）
-- [ ] `build_retrieval_subtree(root_token, M, template, k_ret)`：root 中心按模板 BFS 查 `M`，
-  产出 token/depth/parents（空行/无效行哨兵回退，保持前缀闭合合法树）。
-- [ ] `graft_hybrid_tree(draft_tree, retrieval_tree, k_max)`：`T_draft^s` 与 `G_ret^s` **共享根合并**、
-  重排索引、重建 `parents`/`node_token_ids`/`node_depths`/`child_maps`/`visibility`。
-  - 默认去重跳过（§4.3 方案 A）；
-  - ablation 分支 1 `--graft-insert into_slot`（逐空位填到被剪父节点下）；
-  - ablation 分支 2 `--graft-dedup redirect`（重复后代续到已有节点，方案 B）。
-- [ ] `dartree_generate` 在 `build_dartree_supertree` 后调用 `graft_hybrid_tree`，输出与
-  `prepare_tree_attention_inputs` 兼容。
+### Phase 2 — 检索嫁接 + 合并（retrieval grafting）✅ 已完成（除 into_slot ablation）
+- [x] `build_retrieval_subtree(root_token, M, template, k_ret)`（`utils/retrieval.py`）：root 中心按模板 BFS 查 `M`，
+  产出 token/depth/parents/ranks/stats；空行/无效哨兵回退（rank 向上扫描、节点连同子树丢弃），
+  前缀闭合合法树；`k_ret` 封顶。
+- [x] `graft_hybrid_tree(draft_tree, retrieval_tree, k_max, matrix=None, root_token_id=None, dedup="skip", slots=None)`
+  （`utils/retrieval.py`）：`T_draft^s` 与 `G_ret^s` **共享根合并**、重排索引、重建
+  `parents`/`node_token_ids`/`node_depths`/`child_maps`/`visibility`（纯 torch 重建，无 numpy 依赖）。
+  - 默认去重 **方案 A**（`dedup="skip"`）：冲突时用 `M` 重扫后继 rank 救援节点，否则丢节点+子树
+    （`graft_rank_rescanned_nodes`/`dedup_skipped_nodes` 统计）；
+  - ablation 分支 2 `--graft-dedup redirect`（方案 B：重复后代续到已有节点，`dedup_redirected_nodes`）；
+  - ablation 分支 1 `--graft-insert into_slot`（逐空位填充/树内嫁接，非论文方法对照）：
+    `build_dartree_supertree` 新增 `pruned_slots_out` 参数（Top-B 剪枝后暴露被剪节点的
+    (kept 父新索引, 深度) 槽位，GPU/CPU topb 两路径均支持），`_merge_into_slots` 按
+    `M[父token, rank]` 逐槽位填充、rank 逐父递增避让哨兵与同父重复、槽位深度一致性校验；
+  - `k_max` 防御性检查：合并后节点数 ≤ `K_max`。
+- [x] `dartree_generate` 在 `build_dartree_supertree` 后调用 `build_retrieval_subtree` + `graft_hybrid_tree`，
+  输出与 `prepare_tree_attention_inputs` 兼容（token/depth 转张量、`parents`/`child_maps` 列表、CPU visibility）；
+  新增 `stage_times["graft"]` 与 `graft_*` 统计随 `tree_stat_totals` 汇总；`--graft-insert` 选择
+  `root`（默认，root 中心检索子树）或 `into_slot`（逐空位填充）两种合并策略。
+- [x] CLI：`--graft-k`（默认 8）、`--graft-template-depth`、`--graft-root-width`（默认 8）、
+  `--graft-dedup {skip,redirect}`、`--graft-insert {root,into_slot}`；`validate_contract` 校验；
+  `main` 为 graft variant 实例化 `GraftAdjacencyMatrix`（`vocab_size`/`pad_token_id` 取自 target/tokenizer）；
+  `run_dartree.py` 透传。
+- [x] `tests/test_graft_merge.py`（新）：检索子树原语 + 合并一致性单测（前缀闭合 / child_maps /
+  visibility 参照 `build_visibility` 递推）+ 去重 skip/redirect/救援 + into_slot 填充/避让/深度校验 +
+  k_max 越界。
+- [ ] ⚠️ 待办：本机无 torch，`pytest tests/` 未实跑；且 Phase 3 未接时 `M` 全空，
+  graft 运行时会退化为空检索子树（== pruned），需 Phase 3 更新后才有实际检索命中。
 
 ### Phase 3 — 在线更新 M（online update）
 - [ ] 验证后用 `output.logits`（全验证节点）调用 `M.update(...)`。

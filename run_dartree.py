@@ -23,7 +23,7 @@ def main() -> None:
     # Public Domino checkpoint on Hugging Face.
     parser.add_argument("--draft-model", default="Huang2020/Qwen3-4B-Domino-b16")
     parser.add_argument("--dataset", default="gsm8k")
-    parser.add_argument("--variant", choices=["fixed", "pruned"], default="pruned")
+    parser.add_argument("--variant", choices=["fixed", "pruned", "graft"], default="pruned")
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-samples", type=int)
     parser.add_argument("--max-new-tokens", type=int, default=2048)
@@ -33,6 +33,12 @@ def main() -> None:
     parser.add_argument("--supertree-width", type=int, default=12)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--output")
+    parser.add_argument("--graft-ratio", type=float, default=0.6)
+    parser.add_argument("--graft-k", type=int, default=8)
+    parser.add_argument("--graft-template-depth", type=int)
+    parser.add_argument("--graft-root-width", type=int, default=8)
+    parser.add_argument("--graft-dedup", choices=["skip", "redirect"], default="skip")
+    parser.add_argument("--graft-insert", choices=["root", "into_slot"], default="root")
     parser.add_argument("--record-round-trace", action="store_true")
     parser.add_argument(
         "--record-entropy", action="store_true",
@@ -85,6 +91,19 @@ def main() -> None:
         engine_args.append("--record-round-trace")
     if args.record_entropy:
         engine_args.append("--record-entropy")
+    if args.variant == "graft":
+        engine_args += [
+            "--graft-ratio", str(args.graft_ratio),
+            "--graft-k", str(args.graft_k),
+            "--graft-root-width", str(args.graft_root_width),
+            "--graft-dedup", args.graft_dedup,
+            "--graft-insert", args.graft_insert,
+        ]
+        if args.graft_template_depth is not None:
+            engine_args += [
+                "--graft-template-depth",
+                str(args.graft_template_depth),
+            ]
 
     sys.argv = engine_args
     evaluate()
