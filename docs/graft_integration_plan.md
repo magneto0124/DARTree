@@ -278,8 +278,9 @@ lossless。检索节点被 target 拒绝时同样刷 `M`。
   sample 只取最后位置，行为不变。
 - [x] 验证后用 `output.logits`（全验证节点，接受+拒绝都刷）调用 `M.update(verify_input_ids[0], output.logits[0])`，
   即论文 `M[x̃_i] = argtop_k(p̃_{i+1})`；lossless（只改候选建议）。
-- [x] `--graft-warmup N`：前 N 轮解码用**全预算**（不做剪枝到 retain、不做嫁接）但照常刷新 `M`，
-  N 轮后开始 graft（对标论文 ~5 rounds 暖机）。
+- [ ] ⚠️ `--graft-warmup`：**预留占位，未实现**。论文 warmup 是**外部语料预填**（~5 rounds
+  外部数据喂 `update()` 初始化 `M`），不是用被测数据自身积累（自肥无意义）。参数与 CLI 已留
+  空占位（当前传入无效），待实现外部语料 warmup 时再填充。
 - [x] 收尾 a：`default_level_widths` 重写——root 层**优先分配**（`w1 = min(root_width, budget-1)`，
   剩余预算再摊深层），小预算 + 大 `--graft-template-depth` 不再退化为 rank0 单链；
   大预算下 `w1` 仍受 `root_width` 控制（防 Graft(ROOT) 覆辙的意图不变）。
@@ -291,14 +292,20 @@ lossless。检索节点被 target 拒绝时同样刷 `M`。
 
 ### Phase 4 — 接线与评估
 - [x] （部分，Phase 1.5 已完成）`--variant graft`、`--graft-ratio` 已接（parse_args→validate→dartree_generate→build_dartree_supertree）；
-- [x] `--graft-k`、`--graft-template-depth`、`--graft-root-width`、`--graft-dedup`、`--graft-insert`、
-  `--graft-warmup` 均已加（Phase 2/3 期间补齐）。
-- [ ] 预留 `--graft-stages`（V2 置信度阶段表）、`--graft-no-prune`（Graft(ROOT) 对照）尚未加。
-- [ ] `planned_score_select_pairs` 适配 graft variant（检索节点不经 GRU 打分，`construction_budget`
-  仅覆盖 draft 侧 supertree，应确认 graph runner 预热覆盖 graft 轮的实际 draft 宽度）。
-- [ ] 汇总输出新增 `graft_stage_histogram`、`retrieved_node_count`、`retrieval_hit_rate`、
-  `matrix_updated_rows`、`dedup_skipped_nodes`/`dedup_redirected_nodes`、`graft_tpot_ms`。
-- [ ] 与 `fixed`/`pruned`/Domino/AR 对比（`--run-baselines`），验证 speedup 与 MAT。
+- [x] `--graft-k`、`--graft-template-depth`、`--graft-root-width`、`--graft-dedup`、`--graft-insert`
+  均已加（Phase 2/3 期间补齐）；`--graft-warmup` 为占位（未实现，见 Phase 3）。
+- [x] 预留参数已加（占位，使用即抛 `NotImplementedError`）：`--graft-stages`（V2 置信度阶段表）、
+  `--graft-no-prune`（Graft(ROOT) 对照）。
+- [x] `planned_score_select_pairs` 对 graft variant **无需适配**（已确认）：graft 轮 supertree 扩展
+  与 pruned 完全一致（`supertree_widths` + `construction_budget=sum(per_layer_widths)`），graph runner
+  预热组合天然覆盖；剪枝/检索合并均不经 GRU 打分，不影响预热。
+- [x] 汇总输出新增 `graft_stage_histogram`（每轮检索节点数直方图）、`mean_graft_retrieved_nodes`、
+  `matrix_updated_rows`（`graft_matrix.ready_rows()`，随轮次增长，汇总取 max）；
+  `retrieved_node_count`/`retrieval_hit_rate`/`dedup_skipped_nodes`/`dedup_redirected_nodes`/
+  `graft_total_nodes` 等经 `tree_stat_totals → mean_tree_stats` 输出，`graft_tpot_ms` 经
+  `stage_times → stage_tpot_ms["graft"]` 输出；round_trace 每轮新增 `graft_retrieved_nodes`/
+  `graft_hit_rate`/`graft_k_ret`。
+- [ ] 与 `fixed`/`pruned`/Domino/AR 对比（`--run-baselines`），验证 speedup 与 MAT —— ⚠️ 需 GPU 实机。
 
 ### Phase 5 — 性能与健壮性
 - [ ] 检索查表走 GPU gather，保持零 host-device 同步。

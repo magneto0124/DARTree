@@ -40,6 +40,8 @@ def main() -> None:
     parser.add_argument("--graft-dedup", choices=["skip", "redirect"], default="skip")
     parser.add_argument("--graft-insert", choices=["root", "into_slot"], default="root")
     parser.add_argument("--graft-warmup", type=int, default=0)
+    parser.add_argument("--graft-stages", type=str, default=None)
+    parser.add_argument("--graft-no-prune", action="store_true")
     parser.add_argument("--record-round-trace", action="store_true")
     parser.add_argument(
         "--record-entropy", action="store_true",
@@ -106,6 +108,10 @@ def main() -> None:
                 "--graft-template-depth",
                 str(args.graft_template_depth),
             ]
+        if args.graft_stages is not None:
+            engine_args += ["--graft-stages", args.graft_stages]
+        if args.graft_no_prune:
+            engine_args.append("--graft-no-prune")
 
     sys.argv = engine_args
     evaluate()

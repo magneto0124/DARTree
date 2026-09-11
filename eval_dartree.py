@@ -1295,7 +1295,7 @@ def dartree_generate(
     graft_insert: str = "root",
     graft_template_depth: int | None = None,
     graft_root_width: int = 8,
-    graft_warmup_rounds: int = 0,
+    graft_warmup_rounds: int = 0,  # reserved: external-corpus M warm-up, NOT implemented
     correction_scorer: DominoCorrectionScorer,
     candidate_vocab_size: int,
     score_select_graph: DARTreeScoreSelectGraph,
@@ -1373,6 +1373,7 @@ def dartree_generate(
     detail_times: dict[str, float] | None = None
     tree_stat_totals: dict[str, float] = defaultdict(float)
     tree_heights: list[int] = []
+    graft_node_counts: list[int] = []  # retrieved nodes per grafting round
     round_trace: list[dict[str, Any]] = []
     tree_buffers: dict[str, torch.Tensor] = {}
     # Target entropy (nats) at each accepted draft-chain node, DARTree path.
@@ -1433,6 +1434,8 @@ def dartree_generate(
         round_index = len(acceptance_lengths)
         round_start = int(start)
         generated_start = int(start - num_input_tokens)
+        graft_round_filled: int | None = None
+        graft_round_hit_rate: float | None = None
 
         output_ids[
             :, start + 1 : start + block_size
@@ -1581,18 +1584,10 @@ def dartree_generate(
             # supertree pruning step (kept parent + pruned depth per node).
             pruned_slots = []
         if variant == "graft":
-            if round_index < int(graft_warmup_rounds):
-                # Warm-up rounds: keep the full verification budget (no
-                # pruning-to-retain), still refresh M after verification, and
-                # let grafting kick in from round `graft_warmup_rounds` on —
-                # mirrors the paper's ~5 warm-up rounds for the matrix.
-                _retain_budget = None
-                _ret_budget = 0
-            else:
-                prune_target, _ret_budget = resolve_graft_retain(
-                    tree_budget, graft_ratio
-                )
-                _retain_budget = prune_target
+            prune_target, _ret_budget = resolve_graft_retain(
+                tree_budget, graft_ratio
+            )
+            _retain_budget = prune_target
         else:
             _retain_budget = None
             _ret_budget = 0
@@ -1728,6 +1723,11 @@ def dartree_generate(
                     f"[graft-warn] round {round_index}: retrieval filled only "
                     f"{_filled}/{_ret_budget} nodes"
                 )
+            graft_round_filled = _filled
+            graft_round_hit_rate = float(
+                _graft_stats.get("retrieval_hit_rate", 0.0)
+            )
+            graft_node_counts.append(_filled)
             tree_stats.update(_graft_stats)
             stage_times["graft"] += cuda_time(device) - graft_start
         tree_build_elapsed = cuda_time(device) - tree_start
@@ -1914,6 +1914,14 @@ def dartree_generate(
             ]
             if any(final_layer_widths):
                 round_record["final_layer_widths"] = final_layer_widths
+            if graft_round_filled is not None:
+                round_record["graft_retrieved_nodes"] = int(
+                    graft_round_filled
+                )
+                round_record["graft_hit_rate"] = float(
+                    graft_round_hit_rate
+                )
+                round_record["graft_k_ret"] = int(_ret_budget)
             round_trace.append(round_record)
 
         if stop_tensor is not None:
@@ -1981,6 +1989,12 @@ def dartree_generate(
             for key, value in tree_stat_totals.items()
         },
         tree_heights=[int(x) for x in tree_heights],
+        graft_node_counts=[int(x) for x in graft_node_counts],
+        matrix_updated_rows=(
+            int(graft_matrix.ready_rows())
+            if graft_matrix is not None
+            else 0
+        ),
         round_trace=round_trace,
         entropy=entropy_summary,
         entropy_target=entropy_target,
@@ -1993,6 +2007,12 @@ def summarize_choice(rows: list[dict[str, Any]], key: str) -> dict[str, Any]:
     decode_times = [float(x["decode_time_s"]) for x in chosen]
     acceptance = [int(v) for x in chosen for v in x.get("acceptance_lengths", [])]
     tree_heights = [int(v) for x in chosen for v in x.get("tree_heights", [])]
+    graft_counts = [
+        int(v) for x in chosen for v in x.get("graft_node_counts", [])
+    ]
+    matrix_rows = [
+        int(x.get("matrix_updated_rows", 0)) for x in chosen
+    ]
     stage_sum: dict[str, float] = defaultdict(float)
     detail_sum: dict[str, float] = defaultdict(float)
     tree_stat_totals: dict[str, float] = defaultdict(float)
@@ -2032,6 +2052,16 @@ def summarize_choice(rows: list[dict[str, Any]], key: str) -> dict[str, Any]:
         },
         "mean_tree_height": float(np.mean(tree_heights)) if tree_heights else 0.0,
         "max_tree_height": int(max(tree_heights)) if tree_heights else 0,
+        "mean_graft_retrieved_nodes": (
+            float(np.mean(graft_counts)) if graft_counts else 0.0
+        ),
+        "graft_stage_histogram": {
+            str(i): int(graft_counts.count(i))
+            for i in range((max(graft_counts) if graft_counts else 0) + 1)
+        },
+        "matrix_updated_rows": (
+            int(max(matrix_rows)) if matrix_rows else 0
+        ),
         "stage_tpot_ms": {
             name: float(stage_sum[name] / total_tokens * 1000.0)
             for name in sorted(stage_sum)
@@ -2117,6 +2147,13 @@ def row_from_response(
             int(x)
             for x in getattr(response, "tree_heights", [])
         ],
+        "graft_node_counts": [
+            int(v)
+            for v in getattr(response, "graft_node_counts", [])
+        ],
+        "matrix_updated_rows": int(
+            getattr(response, "matrix_updated_rows", 0)
+        ),
         "round_trace": list(
             getattr(response, "round_trace", [])
         ),
@@ -2238,10 +2275,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--graft-warmup", type=int, default=0,
         help=(
-            "Graft variant only: number of leading decoding rounds to run with "
-            "the full verification budget (no retrieval grafting) while still "
-            "refreshing the adjacency matrix M, so grafting starts with a "
-            "warmed-up matrix (paper uses ~5 rounds)."
+            "Graft variant only: RESERVED placeholder — external-corpus warm-up "
+            "of the adjacency matrix M (paper: ~5 rounds of external data) is "
+            "NOT implemented yet; this flag currently has no effect."
+        ),
+    )
+    parser.add_argument(
+        "--graft-stages", type=str, default=None,
+        help=(
+            "Graft variant only: RESERVED — V2 confidence-stage schedule "
+            "(checkpoint-adaptive pruning table, JSON). Not implemented; "
+            "passing it raises NotImplementedError."
+        ),
+    )
+    parser.add_argument(
+        "--graft-no-prune", action="store_true",
+        help=(
+            "Graft variant only: RESERVED — Graft(ROOT) comparison (retrieval "
+            "budget squeezed out of the strongest draft slots without "
+            "pruning). Not implemented; passing it raises NotImplementedError."
         ),
     )
     parser.add_argument(
@@ -2315,6 +2367,16 @@ def validate_contract(args: argparse.Namespace) -> None:
             )
         if int(args.graft_warmup) < 0:
             raise ValueError("--graft-warmup must be non-negative")
+        if args.graft_stages is not None:
+            raise NotImplementedError(
+                "--graft-stages (V2 confidence-stage schedule) is reserved "
+                "and not implemented yet"
+            )
+        if args.graft_no_prune:
+            raise NotImplementedError(
+                "--graft-no-prune (Graft(ROOT) comparison) is reserved "
+                "and not implemented yet"
+            )
         # Static rank-coverage check: level-1 retrieval nodes use ranks
         # 0..w1-1 (w1 = min(root_width, k_ret)), each requiring a matrix
         # column; otherwise those nodes are silently dropped at build time.
