@@ -1295,6 +1295,7 @@ def dartree_generate(
     graft_insert: str = "root",
     graft_template_depth: int | None = None,
     graft_root_width: int = 8,
+    graft_warmup_rounds: int = 0,
     correction_scorer: DominoCorrectionScorer,
     candidate_vocab_size: int,
     score_select_graph: DARTreeScoreSelectGraph,
@@ -1383,18 +1384,41 @@ def dartree_generate(
     hidden_collector.__enter__()
     prefill_start = cuda_time(device)
     hidden_collector.clear()
-    output = target(
-        input_ids,
-        position_ids=position_ids[:, :num_input_tokens],
-        past_key_values=past_key_values_target,
-        use_cache=True,
-        logits_to_keep=1,
-        output_hidden_states=False,
-    )
+    if graft_matrix is not None:
+        # Phase 3: the prefill pass also seeds the adjacency matrix M — every
+        # prompt token's row becomes the target's top-k continuation, so the
+        # first round's root row (input_ids[L-1], whose continuation is the
+        # last prefill logit) is ready before the first grafting step.  Row
+        # semantics: logits[i] predicts the token after input_ids[i], so
+        # M[input_ids[i]] = argtop_k(p_next | input_ids[i]).
+        output = target(
+            input_ids,
+            position_ids=position_ids[:, :num_input_tokens],
+            past_key_values=past_key_values_target,
+            use_cache=True,
+            logits_to_keep=num_input_tokens,
+            output_hidden_states=False,
+        )
+        prefill_logits = output.logits
+        graft_matrix.update(
+            input_ids[0].contiguous(),
+            prefill_logits[0].contiguous(),
+        )
+        prefill_sample_logits = prefill_logits[:, -1:, :]
+    else:
+        output = target(
+            input_ids,
+            position_ids=position_ids[:, :num_input_tokens],
+            past_key_values=past_key_values_target,
+            use_cache=True,
+            logits_to_keep=1,
+            output_hidden_states=False,
+        )
+        prefill_sample_logits = output.logits
     output_ids[:, :num_input_tokens] = input_ids
     output_ids[
         :, num_input_tokens : num_input_tokens + 1
-    ] = sample(output.logits, temperature)
+    ] = sample(prefill_sample_logits, temperature)
     target_hidden = hidden_collector.cat()
     time_to_first_token = cuda_time(device) - prefill_start
 
@@ -1557,12 +1581,21 @@ def dartree_generate(
             # supertree pruning step (kept parent + pruned depth per node).
             pruned_slots = []
         if variant == "graft":
-            prune_target, _ret_budget = resolve_graft_retain(
-                tree_budget, graft_ratio
-            )
-            _retain_budget = prune_target
+            if round_index < int(graft_warmup_rounds):
+                # Warm-up rounds: keep the full verification budget (no
+                # pruning-to-retain), still refresh M after verification, and
+                # let grafting kick in from round `graft_warmup_rounds` on —
+                # mirrors the paper's ~5 warm-up rounds for the matrix.
+                _retain_budget = None
+                _ret_budget = 0
+            else:
+                prune_target, _ret_budget = resolve_graft_retain(
+                    tree_budget, graft_ratio
+                )
+                _retain_budget = prune_target
         else:
             _retain_budget = None
+            _ret_budget = 0
         (
             node_token_ids,
             node_depths,
@@ -1675,7 +1708,27 @@ def dartree_generate(
             parents = merged_tree["parents"]
             child_maps = merged_tree["child_maps"]
             visibility_cpu = merged_tree["visibility"]
-            tree_stats.update(merged_tree["stats"])
+            # 收尾 c: warn when the retrieval budget is mostly wasted (cold
+            # matrix, --graft-k too small, or the root row missing).
+            _graft_stats = merged_tree["stats"]
+            _filled = int(
+                _graft_stats.get(
+                    "graft_slot_filled_nodes",
+                    _graft_stats.get("retrieved_node_count", 0.0),
+                )
+            )
+            if _filled == 0:
+                print(
+                    f"[graft-warn] round {round_index}: retrieval filled "
+                    f"0/{_ret_budget} nodes (cold matrix or rank limits) — "
+                    "graft degrades to pruned"
+                )
+            elif _filled < 0.5 * _ret_budget:
+                print(
+                    f"[graft-warn] round {round_index}: retrieval filled only "
+                    f"{_filled}/{_ret_budget} nodes"
+                )
+            tree_stats.update(_graft_stats)
             stage_times["graft"] += cuda_time(device) - graft_start
         tree_build_elapsed = cuda_time(device) - tree_start
         stage_times["tree_build"] += tree_build_elapsed
@@ -1724,6 +1777,16 @@ def dartree_generate(
         posterior = sample(output.logits, temperature)
         verify_elapsed = cuda_time(device) - verify_start
         stage_times["verify"] += verify_elapsed
+
+        if graft_matrix is not None:
+            # Phase 3: refresh M from the verified target distributions.  Every
+            # verified node (accepted and rejected alike) contributes its row:
+            # M[node_token] = argtop_k(p_next | node_token) — the plan's
+            # "M[x̃_i] = argtop_k(p̃_{i+1})".  Lossless: only candidate advice.
+            graft_matrix.update(
+                verify_input_ids[0],
+                output.logits[0],
+            )
 
         commit_start = cuda_time(device)
         t_commit_follow = detail_start(detail_times, device)
@@ -2173,6 +2236,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--graft-warmup", type=int, default=0,
+        help=(
+            "Graft variant only: number of leading decoding rounds to run with "
+            "the full verification budget (no retrieval grafting) while still "
+            "refreshing the adjacency matrix M, so grafting starts with a "
+            "warmed-up matrix (paper uses ~5 rounds)."
+        ),
+    )
+    parser.add_argument(
         "--depth-bonus", type=float
     )
     parser.add_argument(
@@ -2240,6 +2312,22 @@ def validate_contract(args: argparse.Namespace) -> None:
         ):
             raise ValueError(
                 "--graft-template-depth must be positive when set"
+            )
+        if int(args.graft_warmup) < 0:
+            raise ValueError("--graft-warmup must be non-negative")
+        # Static rank-coverage check: level-1 retrieval nodes use ranks
+        # 0..w1-1 (w1 = min(root_width, k_ret)), each requiring a matrix
+        # column; otherwise those nodes are silently dropped at build time.
+        _draft_retain, _k_ret = resolve_graft_retain(
+            args.tree_budget, args.graft_ratio
+        )
+        _root_rank_demand = min(int(args.graft_root_width), _k_ret)
+        if int(args.graft_k) < _root_rank_demand:
+            raise ValueError(
+                "--graft-k must cover the root-layer rank demand "
+                f"min(--graft-root-width, k_ret) = {_root_rank_demand} "
+                f"(got --graft-k {args.graft_k}); smaller values silently "
+                "drop depth-1 retrieval nodes"
             )
     if args.depth_bonus is None:
         args.depth_bonus = 0.0 if args.variant == "fixed" else -0.2
@@ -2505,6 +2593,7 @@ def main() -> None:
                 graft_insert=args.graft_insert,
                 graft_template_depth=args.graft_template_depth,
                 graft_root_width=args.graft_root_width,
+                graft_warmup_rounds=args.graft_warmup,
                 correction_scorer=correction_scorer,
                 candidate_vocab_size=args.candidate_vocab_size,
                 score_select_graph=score_select_graph,

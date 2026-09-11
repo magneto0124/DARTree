@@ -238,25 +238,29 @@ def default_level_widths(
 ) -> list[int]:
     """Turn a retrieval node budget into a front-loaded per-depth width schedule.
 
-    Level 1 gets ``root_width`` (capped so every remaining level keeps >=1 node), and
-    the rest of the budget is then split as evenly as possible over the remaining
-    levels.  The total always equals ``budget`` (when ``0 < budget``) and the length is
-    at most ``max_depth``.  Callers wanting the paper's exact shapes (Appendix A.1 /
-    Table 7, e.g. ``[8, 10, 8, 6, 5, 4, 4, 4, 3]``) should pass an explicit
-    ``level_widths`` list to :func:`build_retrieval_template` instead.
+    The root-centered retrieval subtree lives or dies by breadth at level 1, so
+    the root layer is allocated **first**: ``w1`` gets up to ``root_width``
+    nodes (capped at ``budget - 1`` so the deeper levels keep at least one
+    node), and only the remainder is spread over the deeper levels.  This keeps
+    a small budget from degenerating into a single rank-0 chain when
+    ``max_depth >= budget`` (previously ``depth = min(max_depth, budget)``
+    forced ``w1 = 1`` in that case).  The total always equals ``budget`` (when
+    ``0 < budget``) and the length is at most ``max_depth``.  Callers wanting
+    the paper's exact shapes (Appendix A.1 / Table 7, e.g.
+    ``[8, 10, 8, 6, 5, 4, 4, 4, 3]``) should pass an explicit ``level_widths``
+    list to :func:`build_retrieval_template` instead.
     """
     budget = int(budget)
     max_depth = int(max_depth)
     if budget <= 0 or max_depth <= 0:
         return []
-    depth = min(max_depth, budget)  # each level needs at least one node
-    if depth == 1:
+    if budget == 1 or max_depth == 1:
         return [budget]
-
-    w1 = min(max(1, int(root_width)), budget - (depth - 1))
+    w1 = min(max(1, int(root_width)), budget - 1)
     rest = budget - w1
-    base, extra = divmod(rest, depth - 1)
-    widths = [w1] + [base + (1 if i < extra else 0) for i in range(depth - 1)]
+    depth = min(max_depth - 1, rest)  # deeper levels (each keeps >= 1 node)
+    base, extra = divmod(rest, depth)
+    widths = [w1] + [base + (1 if i < extra else 0) for i in range(depth)]
     return widths
 
 

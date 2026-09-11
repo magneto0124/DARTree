@@ -272,16 +272,30 @@ lossless。检索节点被 target 拒绝时同样刷 `M`。
 - [ ] ⚠️ 待办：本机无 torch，`pytest tests/` 未实跑；且 Phase 3 未接时 `M` 全空，
   graft 运行时会退化为空检索子树（== pruned），需 Phase 3 更新后才有实际检索命中。
 
-### Phase 3 — 在线更新 M（online update）
-- [ ] 验证后用 `output.logits`（全验证节点）调用 `M.update(...)`。
-- [ ] prefill 用 prefill logits 初始化 `M`。
-- [ ] 可选 `--graft-warmup` 用暖机轮次/外部语料预填。
+### Phase 3 — 在线更新 M（online update）✅ 已完成
+- [x] prefill 用 prefill logits 初始化 `M`：graft 时 prefill 走 `logits_to_keep=num_input_tokens`，
+  对每个 prompt token `M[input_ids[i]] = argtop_k(p_next|input_ids[i])`（首轮 root 行几乎必 ready）；
+  sample 只取最后位置，行为不变。
+- [x] 验证后用 `output.logits`（全验证节点，接受+拒绝都刷）调用 `M.update(verify_input_ids[0], output.logits[0])`，
+  即论文 `M[x̃_i] = argtop_k(p̃_{i+1})`；lossless（只改候选建议）。
+- [x] `--graft-warmup N`：前 N 轮解码用**全预算**（不做剪枝到 retain、不做嫁接）但照常刷新 `M`，
+  N 轮后开始 graft（对标论文 ~5 rounds 暖机）。
+- [x] 收尾 a：`default_level_widths` 重写——root 层**优先分配**（`w1 = min(root_width, budget-1)`，
+  剩余预算再摊深层），小预算 + 大 `--graft-template-depth` 不再退化为 rank0 单链；
+  大预算下 `w1` 仍受 `root_width` 控制（防 Graft(ROOT) 覆辙的意图不变）。
+- [x] 收尾 b：`validate_contract` 静态校验 `--graft-k ≥ min(--graft-root-width, k_ret)`
+  （level-1 rank 需求），否则 depth-1 检索节点会静默丢弃。
+- [x] 收尾 c：`dartree_generate` 检索量过低告警（`retrieved==0` 或 `< 0.5×k_ret` 时
+  `[graft-warn]` 打印，提示冷启动/rank 限制/预算浪费）。
+- [ ] ⚠️ 待办：本机无 torch，`pytest tests/` 未实跑，需在有 torch 环境验证。
 
 ### Phase 4 — 接线与评估
 - [x] （部分，Phase 1.5 已完成）`--variant graft`、`--graft-ratio` 已接（parse_args→validate→dartree_generate→build_dartree_supertree）；
-  其余 `--graft-k`、`--graft-template-depth`、`--graft-warmup`、`--graft-dedup`、
-  预留 `--graft-stages`、`--graft-no-prune` 尚未加。
-- [ ] `validate_contract` / `planned_score_select_pairs` 适配 graft variant。
+- [x] `--graft-k`、`--graft-template-depth`、`--graft-root-width`、`--graft-dedup`、`--graft-insert`、
+  `--graft-warmup` 均已加（Phase 2/3 期间补齐）。
+- [ ] 预留 `--graft-stages`（V2 置信度阶段表）、`--graft-no-prune`（Graft(ROOT) 对照）尚未加。
+- [ ] `planned_score_select_pairs` 适配 graft variant（检索节点不经 GRU 打分，`construction_budget`
+  仅覆盖 draft 侧 supertree，应确认 graph runner 预热覆盖 graft 轮的实际 draft 宽度）。
 - [ ] 汇总输出新增 `graft_stage_histogram`、`retrieved_node_count`、`retrieval_hit_rate`、
   `matrix_updated_rows`、`dedup_skipped_nodes`/`dedup_redirected_nodes`、`graft_tpot_ms`。
 - [ ] 与 `fixed`/`pruned`/Domino/AR 对比（`--run-baselines`），验证 speedup 与 MAT。
@@ -309,6 +323,15 @@ lossless。检索节点被 target 拒绝时同样刷 `M`。
    用 `dedup_skipped_nodes`/`dedup_redirected_nodes` 监控。
 6. **`tree_budget` 语义**：确保 `K_draft^s + K_ret^s ≤ K_max` 严格成立，且
    `prepare_tree_attention_inputs` 的 `max_tree_nodes` 覆盖合并后节点数。
+7. **模板「可填满性」无静态验证（已部分缓解）**：模板总量恒等 `k_ret`（构造不会失败），
+   但「能构造」≠「能填满」——`--graft-k < root 层 rank 需求` 或冷启动时检索节点被静默丢弃。
+   已加：`validate_contract` 静态校验 `--graft-k ≥ min(--graft-root-width, k_ret)`；
+   运行时 `[graft-warn]` 告警（retrieved==0 或 < 0.5×k_ret）。剩余风险：深层 rank 需求
+   （每父多 child）仍可能超 `graft_k`，靠告警 + `retrieval_hit_rate` 观察。
+8. **`--graft-template-depth` 与预算的关系（已修复）**：原 `depth = min(max_depth, budget)`
+   在 `k_ret < max_depth` 时把 root 层宽度压到 1、模板退化为 rank0 单链；`default_level_widths`
+   已改为 root 层优先分配，小预算保持宽浅形状；`--graft-template-depth ≥ k_ret` 后参数饱和
+   （不再加深），属预期。
 
 ---
 

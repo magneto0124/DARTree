@@ -122,3 +122,16 @@ def test_default_level_widths_budgets():
     assert w[0] == 8 and len(w) <= 4 and sum(w) == 28
     # Every level keeps at least one node (root width is capped).
     assert all(x >= 1 for x in default_level_widths(3, 4, root_width=100))
+
+
+def test_default_level_widths_small_budget_keeps_root_breadth():
+    # A small budget with a large depth limit must NOT degenerate into a
+    # single rank-0 chain: the root layer keeps its breadth first.
+    w = default_level_widths(8, 16)
+    assert w[0] >= 4  # root layer holds at least half the budget
+    assert sum(w) == 8
+    assert len(w) <= 16
+    # Deeper levels still keep at least one node each.
+    assert all(x >= 1 for x in w)
+    # max_depth=1 keeps everything on a single level.
+    assert default_level_widths(8, 1) == [8]
