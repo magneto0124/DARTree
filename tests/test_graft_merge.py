@@ -290,12 +290,12 @@ def test_graft_hybrid_tree_same_token_different_parent_ok():
     }
     m = make_matrix(rows={0: [2, 3, 4], 2: [7, 8, 9]})
     parents, ranks, depths = build_retrieval_template([2, 1])
-    ret = build_retrieval_subtree(0, m, (parents, ranks, depths), k_ret=2)
+    ret = build_retrieval_subtree(0, m, (parents, ranks, depths), k_ret=3)
     merged = graft_hybrid_tree(draft, ret, k_max=10)
     assert_valid_tree(merged)
-    assert merged["node_token_ids"] == [1, 5, 7, 2, 7]
-    assert merged["parents"] == [-1, 0, 0, 1, 0, 4]
-    assert merged["node_depths"] == [1, 1, 2, 1, 2]
+    assert merged["node_token_ids"] == [1, 5, 7, 2, 3, 7]
+    assert merged["parents"] == [-1, 0, 0, 1, 0, 0, 4]
+    assert merged["node_depths"] == [1, 1, 2, 1, 1, 2]
     assert merged["stats"]["dedup_skipped_nodes"] == 0.0
 
 
