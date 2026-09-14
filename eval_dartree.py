@@ -23,6 +23,7 @@ from utils import (
     DFlashDraftModel,
     DominoCorrectionScorer,
     DraftCorrectionGraphRunner,
+    NoopNgram,
     cuda_time,
     load_and_process_dataset,
     logits_entropy,
@@ -611,6 +612,11 @@ def build_dartree_supertree(
     score_select_graph: DARTreeScoreSelectGraph,
     tree_buffers: dict[str, torch.Tensor],
     pruned: bool,
+    ngram_model: Any | None = None,
+    ngram_weight: float = 0.0,
+    use_dart_level_weights: bool = False,
+    allow_fused_select: bool = True,
+    ngram_eps: float = 1e-10,
     detail_times: dict[str, float] | None = None,
 ) -> tuple[
     torch.Tensor,
@@ -811,7 +817,7 @@ def build_dartree_supertree(
             candidate_ids, candidate_base_vals, candidate_weights, _ = (
                 candidate_tables
             )
-            if int(expansion_count) <= int(candidate_ids.shape[-1]):
+            if allow_fused_select and int(expansion_count) <= int(candidate_ids.shape[-1]):
                 z_i = z_parts[:, slot : slot + 1, :].expand(
                     parent_count, -1, -1
                 )[:, 0, :]
@@ -864,7 +870,7 @@ def build_dartree_supertree(
                 if candidate_biases is None
                 else candidate_biases[slot]
             )
-            if int(expansion_count) <= int(candidate_ids.shape[-1]):
+            if allow_fused_select and int(expansion_count) <= int(candidate_ids.shape[-1]):
                 fused_selection = score_select_graph.run(
                     z_proj=z_i,
                     h_state=parent_hidden_2d,
@@ -926,6 +932,45 @@ def build_dartree_supertree(
             t_score,
             device,
         )
+
+        if fused_selection is None:
+            # DART-style continuity-aware scoring (Algorithm 1 / App. D):
+            #   score += w_level * (w_logit * s_logit + w_ngram * s_ngram)
+            # with w_level = (level+1)**-0.7, w_logit = 0.9**level and
+            # w_ngram = ngram_weight; s_ngram = log(Pr_ngram(t | ctx) + eps).
+            # ctx is the node's path suffix (the parent token for a 2-gram),
+            # falling back to the root token for the first level, exactly like
+            # DART's searcher falls back to the prompt suffix.
+            level = child_depth - 1
+            if use_dart_level_weights:
+                w_level = (float(level) + 1.0) ** -0.7
+                w_logit = 0.9 ** float(level)
+            else:
+                w_level, w_logit = 1.0, 1.0
+            if ngram_model is not None and ngram_weight > 0:
+                parent_tokens = (
+                    [int(root_token_id)] * int(parent_count)
+                    if child_depth == 1
+                    else tokens_t[parent_indices - 1].cpu().tolist()
+                )
+                cand_ids = top_ids.cpu().tolist()
+                ngram_rows = []
+                for ctx, cands in zip(parent_tokens, cand_ids):
+                    probs, _matched = ngram_model.get_probability(
+                        [ctx], list(cands)
+                    )
+                    ngram_rows.append([float(p) for p in probs])
+                p_ng = torch.tensor(
+                    ngram_rows,
+                    dtype=top_scores.dtype,
+                    device=top_scores.device,
+                )
+                s_ng = torch.log(p_ng + ngram_eps)
+                top_scores = w_level * (
+                    w_logit * top_scores + ngram_weight * s_ng
+                )
+            else:
+                top_scores = (w_level * w_logit) * top_scores
 
         t_select = detail_start(detail_times, device)
         scored_candidate_count = (
@@ -1249,6 +1294,9 @@ def dartree_generate(
     score_select_graph: DARTreeScoreSelectGraph,
     temperature: float,
     stop_token_ids: list[int] | None,
+    ngram_model: Any | None = None,
+    ngram_weight: float = 0.0,
+    use_dart_level_weights: bool = False,
     record_round_trace: bool = False,
     record_entropy: bool = False,
     verify_buffer_nodes: int = 0,
@@ -1524,6 +1572,13 @@ def dartree_generate(
             score_select_graph=score_select_graph,
             tree_buffers=tree_buffers,
             pruned=(variant == "pruned"),
+            ngram_model=ngram_model,
+            ngram_weight=ngram_weight,
+            use_dart_level_weights=use_dart_level_weights,
+            allow_fused_select=(
+                not use_dart_level_weights
+                and not (ngram_weight > 0 and ngram_model is not None)
+            ),
             detail_times=detail_times,
         )
         tree_build_elapsed = cuda_time(device) - tree_start
@@ -1975,6 +2030,22 @@ def parse_args() -> argparse.Namespace:
         "--depth-bonus", type=float
     )
     parser.add_argument(
+        "--ngram-weight", type=float, default=0.0,
+        help=(
+            "Weight of the DART-style n-gram continuity term in tree "
+            "scoring (Algorithm 1). 0 disables it (ablation baseline); "
+            "0.5 is DART's default. The n-gram model itself is not wired "
+            "yet -- a NoopNgram placeholder is used, so the term is 0."
+        ),
+    )
+    parser.add_argument(
+        "--use-dart-level-weights", action="store_true",
+        help=(
+            "Apply DART's per-level weights w_level=(level+1)**-0.7 and "
+            "w_logit=0.9**level to the per-level score increment."
+        ),
+    )
+    parser.add_argument(
         "--temperature", type=float, default=0.0
     )
     parser.add_argument("--device", default="cuda:0")
@@ -2020,6 +2091,8 @@ def validate_contract(args: argparse.Namespace) -> None:
     for name, value in positive_args.items():
         if int(value) <= 0:
             raise ValueError(f"{name} must be positive")
+    if float(args.ngram_weight) < 0:
+        raise ValueError("--ngram-weight must be non-negative")
     if int(args.candidate_vocab_size) < int(args.expansion_k):
         raise ValueError(
             "--candidate-vocab-size must be at least --expansion-k"
@@ -2130,6 +2203,17 @@ def main() -> None:
             dummy_token, dummy_hidden
         )
     synchronize(device)
+
+    ngram_model = None
+    if float(args.ngram_weight) > 0:
+        # Placeholder until the real 2-gram table lands: it contributes an
+        # all-zero n-gram term, so the DART-style scoring path is exercised
+        # end-to-end with no behavioural change.
+        ngram_model = NoopNgram()
+        print(
+            "[ngram] --ngram-weight > 0 but no n-gram model is wired yet; "
+            "using NoopNgram placeholder (n-gram term = 0)."
+        )
 
     candidate_vocab_size = int(args.candidate_vocab_size)
     expansion_k = min(
@@ -2272,6 +2356,11 @@ def main() -> None:
                 stop_token_ids=[
                     tokenizer.eos_token_id
                 ],
+                ngram_model=ngram_model,
+                ngram_weight=args.ngram_weight,
+                use_dart_level_weights=(
+                    args.use_dart_level_weights
+                ),
                 record_round_trace=(
                     args.record_round_trace
                 ),

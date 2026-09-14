@@ -33,6 +33,8 @@ def main() -> None:
     parser.add_argument("--candidate-k", type=int, default=64)
     parser.add_argument("--supertree-width", type=int, default=12)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--ngram-weight", type=float, default=0.0)
+    parser.add_argument("--use-dart-level-weights", action="store_true")
     parser.add_argument("--output")
     parser.add_argument("--record-round-trace", action="store_true")
     parser.add_argument(
@@ -71,8 +73,11 @@ def main() -> None:
         "--candidate-vocab-size", str(args.candidate_k),
         "--temperature", str(args.temperature),
         "--device", args.device,
+        "--ngram-weight", str(args.ngram_weight),
         "--output", output,
     ]
+    if args.use_dart_level_weights:
+        engine_args.append("--use-dart-level-weights")
     if args.variant == "fixed":
         engine_args += [
             "--depth-bonus", "0",
