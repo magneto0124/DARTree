@@ -31,7 +31,6 @@ from utils import (
 )
 from utils.device_backend import (
     accelerator_available,
-    can_use_cuda_graphs,
     device_type,
     is_accelerator_device,
     seed_all,
@@ -44,229 +43,6 @@ REPO_ROOT = Path(__file__).resolve().parent
 
 
 STAGE_NAMES = ("draft", "tree_build", "tree_setup", "verify", "commit")
-
-
-class DARTreeScoreSelectGraph:
-    """CUDA graph for candidate scoring and frontier selection."""
-
-    def __init__(
-        self,
-        scorer: DominoCorrectionScorer,
-        *,
-        device: torch.device,
-        max_batch: int = 16,
-        candidate_count: int = 64,
-        select_candidate_count: int | None = None,
-        max_select: int = 8,
-        dtype: torch.dtype = torch.bfloat16,
-        include_gru: bool = False,
-        warm_pairs: list[tuple[int, int]] | None = None,
-    ) -> None:
-        self.scorer = scorer
-        self.device = device
-        self.max_batch = max(1, int(max_batch))
-        self.candidate_count = max(1, int(candidate_count))
-        self.select_candidate_count = max(
-            1,
-            min(
-                int(self.candidate_count),
-                (
-                    int(select_candidate_count)
-                    if select_candidate_count is not None
-                    else int(self.candidate_count)
-                ),
-            ),
-        )
-        self.max_select = max(1, int(max_select))
-        self.dtype = dtype
-        self.include_gru = bool(include_gru)
-        self.graphs: dict[tuple[int, int, int, torch.dtype], dict[str, Any]] = {}
-        # CUDA-graph capture is NVIDIA-only; on an Ascend NPU the caller falls
-        # back to the eager score/select path (run() returns None).
-        self.enabled = can_use_cuda_graphs(device)
-        if self.enabled and warm_pairs is not None:
-            for batch_size, selected_count in sorted(set((int(b), int(s)) for b, s in warm_pairs)):
-                if (
-                    batch_size > 0
-                    and batch_size <= self.max_batch
-                    and selected_count > 0
-                    and selected_count <= self.max_select
-                    and selected_count <= batch_size * self.select_candidate_count
-                ):
-                    self._capture(
-                        batch_size=batch_size,
-                        selected_count=selected_count,
-                        select_candidate_count=self.select_candidate_count,
-                        dtype=dtype,
-                    )
-        elif self.enabled:
-            for batch_size in range(1, self.max_batch + 1):
-                max_for_batch = min(self.max_select, batch_size * self.select_candidate_count)
-                for selected_count in range(1, max_for_batch + 1):
-                    self._capture(
-                        batch_size=batch_size,
-                        selected_count=selected_count,
-                        select_candidate_count=self.select_candidate_count,
-                        dtype=dtype,
-                    )
-
-    def _capture(
-        self,
-        *,
-        batch_size: int,
-        selected_count: int,
-        select_candidate_count: int,
-        dtype: torch.dtype,
-    ) -> dict[str, Any] | None:
-        if not self.enabled:
-            return None
-        batch_size = int(batch_size)
-        selected_count = int(selected_count)
-        select_candidate_count = max(1, min(int(select_candidate_count), int(self.candidate_count)))
-        if (
-            batch_size <= 0
-            or batch_size > self.max_batch
-            or selected_count <= 0
-            or selected_count > self.max_select
-            or selected_count > batch_size * select_candidate_count
-        ):
-            return None
-        key = (batch_size, selected_count, select_candidate_count, dtype)
-        cached = self.graphs.get(key)
-        if cached is not None:
-            return cached
-
-        hidden_dim = int(self.scorer.w_s.shape[1])
-        mid_dim = int(self.scorer.w_s.shape[0])
-        h_static = torch.zeros((batch_size, hidden_dim), dtype=dtype, device=self.device)
-        z_static = torch.zeros((batch_size, mid_dim), dtype=dtype, device=self.device)
-        candidate_weight = torch.zeros(
-            (self.candidate_count, mid_dim),
-            dtype=dtype,
-            device=self.device,
-        )
-        candidate_base = torch.zeros(
-            (self.candidate_count,),
-            dtype=torch.float32,
-            device=self.device,
-        )
-        candidate_bias = torch.zeros((self.candidate_count,), dtype=dtype, device=self.device)
-        candidate_ids = torch.arange(self.candidate_count, dtype=torch.long, device=self.device)
-        parent_scores = torch.zeros((batch_size,), dtype=torch.float32, device=self.device)
-        parent_indices = torch.arange(batch_size, dtype=torch.long, device=self.device)
-
-        def graph_body() -> tuple[torch.Tensor, ...]:
-            s_proj = F.linear(h_static, self.scorer.w_s, None)
-            mid = F.silu((z_static + s_proj).unsqueeze(1)).squeeze(1)
-            logits = (
-                candidate_base.view(1, -1).to(mid.dtype)
-                + candidate_bias.view(1, -1)
-                + (mid @ candidate_weight.t())
-            ).float()
-            log_z = torch.logsumexp(logits, dim=-1, keepdim=True)
-            logits_for_select = logits[:, :select_candidate_count]
-            path_scores = parent_scores.unsqueeze(1) + logits_for_select - log_z
-            _selected_prios, selected_flat = torch.topk(
-                path_scores.reshape(-1),
-                k=selected_count,
-                dim=0,
-            )
-            selected_parent_pos = torch.div(
-                selected_flat,
-                select_candidate_count,
-                rounding_mode="floor",
-            )
-            selected_rank = selected_flat.remainder(select_candidate_count)
-            selected_tokens = candidate_ids.index_select(0, selected_rank).contiguous()
-            selected_path_scores = path_scores[selected_parent_pos, selected_rank].contiguous()
-            selected_parent_indices = parent_indices.index_select(0, selected_parent_pos)
-            outputs: tuple[torch.Tensor, ...] = (
-                selected_parent_pos,
-                selected_rank,
-                selected_tokens,
-                selected_path_scores,
-                selected_parent_indices,
-            )
-            if self.include_gru:
-                parent_h0 = h_static.index_select(0, selected_parent_pos)
-                gi = self.scorer._gru_input_proj_table.index_select(0, selected_tokens)
-                gh = F.linear(parent_h0, self.scorer.gru_w_hh, self.scorer.gru_b_hh)
-                g = int(self.scorer.gru_hidden_dim)
-                i_r, i_z, i_n = gi[:, :g], gi[:, g : 2 * g], gi[:, 2 * g :]
-                h_r, h_z, h_n = gh[:, :g], gh[:, g : 2 * g], gh[:, 2 * g :]
-                r = torch.sigmoid(i_r + h_r)
-                z = torch.sigmoid(i_z + h_z)
-                n = torch.tanh(i_n + r * h_n)
-                child_hidden = (1.0 - z) * n + z * parent_h0
-                outputs = outputs + (child_hidden,)
-            return outputs
-
-        for _ in range(3):
-            graph_body()
-        torch.cuda.synchronize(self.device)
-        graph = torch.cuda.CUDAGraph()
-        with torch.inference_mode(), torch.cuda.graph(graph):
-            outputs = graph_body()
-        entry = {
-            "graph": graph,
-            "h": h_static,
-            "z": z_static,
-            "candidate_weight": candidate_weight,
-            "candidate_base": candidate_base,
-            "candidate_bias": candidate_bias,
-            "candidate_ids": candidate_ids,
-            "parent_scores": parent_scores,
-            "parent_indices": parent_indices,
-            "outputs": outputs,
-        }
-        self.graphs[key] = entry
-        return entry
-
-    def run(
-        self,
-        *,
-        z_proj: torch.Tensor,
-        h_state: torch.Tensor,
-        candidate_ids: torch.Tensor,
-        candidate_base_vals: torch.Tensor,
-        candidate_weight: torch.Tensor,
-        candidate_bias: torch.Tensor | None,
-        parent_scores: torch.Tensor,
-        parent_indices: torch.Tensor,
-        selected_count: int,
-        select_candidate_count: int | None = None,
-    ) -> tuple[torch.Tensor, ...] | None:
-        if not self.enabled:
-            return None
-        batch_size = int(h_state.shape[0])
-        if int(candidate_ids.numel()) != self.candidate_count:
-            return None
-        select_count = (
-            int(self.select_candidate_count)
-            if select_candidate_count is None
-            else max(1, min(int(select_candidate_count), int(self.candidate_count)))
-        )
-        entry = self._capture(
-            batch_size=batch_size,
-            selected_count=int(selected_count),
-            select_candidate_count=int(select_count),
-            dtype=h_state.dtype,
-        )
-        if entry is None:
-            return None
-        entry["h"].copy_(h_state)
-        entry["z"].copy_(z_proj)
-        entry["candidate_weight"].copy_(candidate_weight)
-        entry["candidate_base"].copy_(candidate_base_vals.float())
-        entry["candidate_ids"].copy_(candidate_ids.long())
-        entry["parent_scores"].copy_(parent_scores.float())
-        entry["parent_indices"].copy_(parent_indices.long())
-        if candidate_bias is not None:
-            entry["candidate_bias"].copy_(candidate_bias)
-        else:
-            entry["candidate_bias"].zero_()
-        entry["graph"].replay()
-        return entry["outputs"]
 
 
 def stage_dict() -> dict[str, float]:
@@ -413,39 +189,6 @@ def select_topb_prefix_tree_tensor(
         sorted=False,
     ).indices
     return torch.sort(selected.add_(1)).values
-
-
-def planned_score_select_pairs(
-    *,
-    budget: int,
-    depth_limit: int,
-    candidate_count: int,
-    per_layer_widths: list[int] | None,
-) -> set[tuple[int, int]]:
-    pairs: set[tuple[int, int]] = set()
-    depth_limit = max(1, int(depth_limit))
-    candidate_count = max(1, int(candidate_count))
-    budget = max(1, int(budget))
-    node_count = 0
-    frontier_len = 1
-    for child_depth in range(1, depth_limit + 1):
-        if frontier_len <= 0 or node_count >= budget:
-            break
-        remaining = budget - node_count
-        remaining_depths = max(1, depth_limit - child_depth + 1)
-        quota = (
-            int(per_layer_widths[child_depth - 1])
-            if per_layer_widths is not None
-            else int(np.ceil(remaining / remaining_depths))
-        )
-        quota = max(1, min(remaining, quota))
-        selected_count = min(quota, frontier_len * candidate_count)
-        if selected_count <= 0:
-            break
-        pairs.add((frontier_len, selected_count))
-        frontier_len = selected_count
-        node_count += selected_count
-    return pairs
 
 
 def prepare_tree_attention_inputs(
@@ -609,13 +352,10 @@ def build_dartree_supertree(
     correction_scorer: DominoCorrectionScorer,
     z_parts: torch.Tensor,
     candidate_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None],
-    score_select_graph: DARTreeScoreSelectGraph,
     tree_buffers: dict[str, torch.Tensor],
     pruned: bool,
     ngram_model: Any | None = None,
     ngram_weight: float = 0.0,
-    use_dart_level_weights: bool = False,
-    allow_fused_select: bool = True,
     ngram_eps: float = 1e-10,
     detail_times: dict[str, float] | None = None,
 ) -> tuple[
@@ -734,12 +474,6 @@ def build_dartree_supertree(
     expanded_layers = 0
     scored_parent_count = 0
     max_frontier_width = 0
-    fused_score_select_layers = 0
-    fused_gru_layers = 0
-    fallback_gru_layers = 0
-    graph_miss_batch_layers = 0
-    graph_miss_select_layers = 0
-    graph_miss_other_layers = 0
     supertree_node_count = 0
     supertree_budget = (
         sum(int(width) for width in supertree_widths)
@@ -809,56 +543,9 @@ def build_dartree_supertree(
         )
         if selected_count <= 0:
             break
-        fused_selection = None
-        fused_child_hidden_2d = None
 
         t_score = detail_start(detail_times, device)
-        if slot < prefix_len:
-            candidate_ids, candidate_base_vals, candidate_weights, _ = (
-                candidate_tables
-            )
-            if allow_fused_select and int(expansion_count) <= int(candidate_ids.shape[-1]):
-                z_i = z_parts[:, slot : slot + 1, :].expand(
-                    parent_count, -1, -1
-                )[:, 0, :]
-                zero_candidate_weight = reusable_buffer(
-                    "zero_candidate_weight",
-                    tuple(candidate_weights[slot].shape),
-                    candidate_weights.dtype,
-                )
-                zero_candidate_weight.zero_()
-                zero_candidate_bias = reusable_buffer(
-                    "zero_candidate_bias",
-                    tuple(candidate_base_vals[slot].shape),
-                    candidate_weights.dtype,
-                )
-                zero_candidate_bias.zero_()
-                fused_selection = score_select_graph.run(
-                    z_proj=z_i,
-                    h_state=parent_hidden_2d,
-                    candidate_ids=candidate_ids[slot],
-                    candidate_base_vals=candidate_base_vals[slot],
-                    candidate_weight=zero_candidate_weight,
-                    candidate_bias=zero_candidate_bias,
-                    parent_scores=parent_scores_1d,
-                    parent_indices=parent_indices,
-                    selected_count=selected_count,
-                    select_candidate_count=int(expansion_count),
-                )
-                if fused_selection is not None:
-                    fused_score_select_layers += 1
-                elif parent_count > int(
-                    score_select_graph.max_batch
-                ):
-                    graph_miss_batch_layers += 1
-                elif selected_count > int(
-                    score_select_graph.max_select
-                ):
-                    graph_miss_select_layers += 1
-                else:
-                    graph_miss_other_layers += 1
-
-        if fused_selection is None and slot >= prefix_len:
+        if slot >= prefix_len:
             z_i = z_parts[:, slot : slot + 1, :].expand(
                 parent_count, -1, -1
             )[:, 0, :]
@@ -870,47 +557,21 @@ def build_dartree_supertree(
                 if candidate_biases is None
                 else candidate_biases[slot]
             )
-            if allow_fused_select and int(expansion_count) <= int(candidate_ids.shape[-1]):
-                fused_selection = score_select_graph.run(
-                    z_proj=z_i,
-                    h_state=parent_hidden_2d,
-                    candidate_ids=candidate_ids[slot],
-                    candidate_base_vals=candidate_base_vals[slot],
-                    candidate_weight=candidate_weights[slot],
-                    candidate_bias=bias_i,
-                    parent_scores=parent_scores_1d,
-                    parent_indices=parent_indices,
-                    selected_count=selected_count,
-                    select_candidate_count=int(expansion_count),
+            top_vals, top_ids, log_z = (
+                correction_scorer.candidate_topk_from_precomputed(
+                    z_i,
+                    parent_hidden_2d,
+                    candidate_ids[slot],
+                    candidate_base_vals[slot],
+                    candidate_weights[slot],
+                    bias_i,
+                    expansion_count,
+                    sort_result=False,
+                    compute_log_z=True,
                 )
-                if fused_selection is not None:
-                    fused_score_select_layers += 1
-                elif parent_count > int(
-                    score_select_graph.max_batch
-                ):
-                    graph_miss_batch_layers += 1
-                elif selected_count > int(
-                    score_select_graph.max_select
-                ):
-                    graph_miss_select_layers += 1
-                else:
-                    graph_miss_other_layers += 1
-            if fused_selection is None:
-                top_vals, top_ids, log_z = (
-                    correction_scorer.candidate_topk_from_precomputed(
-                        z_i,
-                        parent_hidden_2d,
-                        candidate_ids[slot],
-                        candidate_base_vals[slot],
-                        candidate_weights[slot],
-                        bias_i,
-                        expansion_count,
-                        sort_result=False,
-                        compute_log_z=True,
-                    )
-                )
-                top_scores = top_vals.float() - log_z.float()
-        elif fused_selection is None:
+            )
+            top_scores = top_vals.float() - log_z.float()
+        else:
             logits = base_logits[:, slot : slot + 1, :].expand(
                 parent_count, -1, -1
             )
@@ -924,126 +585,89 @@ def build_dartree_supertree(
             top_scores = top_vals - log_z
         add_elapsed(
             detail_times,
-            (
-                "tree_score_select_fused"
-                if fused_selection is not None
-                else "tree_score"
-            ),
+            "tree_score",
             t_score,
             device,
         )
 
-        if fused_selection is None:
-            # DART-style continuity-aware scoring (Algorithm 1 / App. D):
-            #   score += w_level * (w_logit * s_logit + w_ngram * s_ngram)
-            # with w_level = (level+1)**-0.7, w_logit = 0.9**level and
-            # w_ngram = ngram_weight; s_ngram = log(Pr_ngram(t | ctx) + eps).
-            # ctx is the node's path suffix (the parent token for a 2-gram),
-            # falling back to the root token for the first level, exactly like
-            # DART's searcher falls back to the prompt suffix.
+        # DART-style continuity-aware scoring (Algorithm 1 / App. D):
+        #   score += w_level * (w_logit * s_logit + w_ngram * s_ngram)
+        # with w_level = (level+1)**-0.7, w_logit = 0.9**level and
+        # w_ngram = ngram_weight; s_ngram = log(Pr_ngram(t | ctx) + eps).
+        # ctx is the node's path suffix (the parent token for a 2-gram),
+        # falling back to the root token for the first level, exactly like
+        # DART's searcher falls back to the prompt suffix.
+        # Active only when an n-gram model is wired; otherwise the score
+        # stays exactly the original DARTree logit score (unchanged).
+        if ngram_model is not None and ngram_weight > 0:
             level = child_depth - 1
-            if use_dart_level_weights:
-                w_level = (float(level) + 1.0) ** -0.7
-                w_logit = 0.9 ** float(level)
-            else:
-                w_level, w_logit = 1.0, 1.0
-            if ngram_model is not None and ngram_weight > 0:
-                parent_tokens = (
-                    [int(root_token_id)] * int(parent_count)
-                    if child_depth == 1
-                    else tokens_t[parent_indices - 1].cpu().tolist()
+            w_level = (float(level) + 1.0) ** -0.7
+            w_logit = 0.9 ** float(level)
+            parent_tokens = (
+                [int(root_token_id)] * int(parent_count)
+                if child_depth == 1
+                else tokens_t[parent_indices - 1].cpu().tolist()
+            )
+            cand_ids = top_ids.cpu().tolist()
+            ngram_rows = []
+            for ctx, cands in zip(parent_tokens, cand_ids):
+                probs, _matched = ngram_model.get_probability(
+                    [ctx], list(cands)
                 )
-                cand_ids = top_ids.cpu().tolist()
-                ngram_rows = []
-                for ctx, cands in zip(parent_tokens, cand_ids):
-                    probs, _matched = ngram_model.get_probability(
-                        [ctx], list(cands)
-                    )
-                    ngram_rows.append([float(p) for p in probs])
-                p_ng = torch.tensor(
-                    ngram_rows,
-                    dtype=top_scores.dtype,
-                    device=top_scores.device,
-                )
-                s_ng = torch.log(p_ng + ngram_eps)
-                top_scores = w_level * (
-                    w_logit * top_scores + ngram_weight * s_ng
-                )
-            else:
-                top_scores = (w_level * w_logit) * top_scores
+                ngram_rows.append([float(p) for p in probs])
+            p_ng = torch.tensor(
+                ngram_rows,
+                dtype=top_scores.dtype,
+                device=top_scores.device,
+            )
+            s_ng = torch.log(p_ng + ngram_eps)
+            top_scores = w_level * (
+                w_logit * top_scores + ngram_weight * s_ng
+            )
 
         t_select = detail_start(detail_times, device)
-        scored_candidate_count = (
-            int(top_scores.shape[1])
-            if fused_selection is None
-            else int(expansion_count)
+        scored_candidate_count = int(top_scores.shape[1])
+        selected_count = min(
+            int(selected_count),
+            int(parent_count) * max(1, scored_candidate_count),
         )
-        if fused_selection is None:
-            selected_count = min(
-                int(selected_count),
-                int(parent_count) * max(1, scored_candidate_count),
-            )
-            if selected_count <= 0:
-                break
+        if selected_count <= 0:
+            break
 
-        if fused_selection is not None:
-            if len(fused_selection) == 6:
-                (
-                    selected_parent_pos,
-                    _selected_rank,
-                    selected_tokens,
-                    selected_path_scores,
-                    selected_parent_indices,
-                    fused_child_hidden_2d,
-                ) = fused_selection
-            else:
-                (
-                    selected_parent_pos,
-                    _selected_rank,
-                    selected_tokens,
-                    selected_path_scores,
-                    selected_parent_indices,
-                ) = fused_selection
-        else:
-            path_scores = parent_scores_1d.unsqueeze(1) + top_scores
-            _selected_prios, selected_flat = torch.topk(
-                path_scores.reshape(-1),
-                k=selected_count,
-                dim=0,
-            )
-            selected_parent_pos = torch.div(
-                selected_flat,
-                scored_candidate_count,
-                rounding_mode="floor",
-            )
-            selected_rank = selected_flat.remainder(
-                scored_candidate_count
-            )
-            selected_parent_indices = parent_indices.index_select(
-                0, selected_parent_pos
-            )
-            selected_tokens = top_ids[
-                selected_parent_pos, selected_rank
-            ].contiguous()
-            selected_path_scores = path_scores[
-                selected_parent_pos, selected_rank
-            ].contiguous()
+        path_scores = parent_scores_1d.unsqueeze(1) + top_scores
+        _selected_prios, selected_flat = torch.topk(
+            path_scores.reshape(-1),
+            k=selected_count,
+            dim=0,
+        )
+        selected_parent_pos = torch.div(
+            selected_flat,
+            scored_candidate_count,
+            rounding_mode="floor",
+        )
+        selected_rank = selected_flat.remainder(
+            scored_candidate_count
+        )
+        selected_parent_indices = parent_indices.index_select(
+            0, selected_parent_pos
+        )
+        selected_tokens = top_ids[
+            selected_parent_pos, selected_rank
+        ].contiguous()
+        selected_path_scores = path_scores[
+            selected_parent_pos, selected_rank
+        ].contiguous()
         add_elapsed(
             detail_times, "tree_select", t_select, device
         )
 
         t_gru_batch = detail_start(detail_times, device)
-        if fused_child_hidden_2d is not None:
-            child_hidden_batch = fused_child_hidden_2d.unsqueeze(0)
-            fused_gru_layers += 1
-        else:
-            parent_h0 = parent_hidden_2d.index_select(
-                0, selected_parent_pos
-            ).unsqueeze(0)
-            child_hidden_batch = update_child_hidden(
-                selected_tokens.view(-1, 1), parent_h0
-            )
-            fallback_gru_layers += 1
+        parent_h0 = parent_hidden_2d.index_select(
+            0, selected_parent_pos
+        ).unsqueeze(0)
+        child_hidden_batch = update_child_hidden(
+            selected_tokens.view(-1, 1), parent_h0
+        )
         add_elapsed(
             detail_times,
             "tree_gru_update",
@@ -1248,12 +872,6 @@ def build_dartree_supertree(
         "expanded_layers": float(expanded_layers),
         "scored_parent_count": float(scored_parent_count),
         "max_frontier_width": float(max_frontier_width),
-        "fused_score_select_layers": float(fused_score_select_layers),
-        "fused_gru_layers": float(fused_gru_layers),
-        "fallback_gru_layers": float(fallback_gru_layers),
-        "graph_miss_batch_layers": float(graph_miss_batch_layers),
-        "graph_miss_select_layers": float(graph_miss_select_layers),
-        "graph_miss_other_layers": float(graph_miss_other_layers),
         "pruned": 1.0 if pruned else 0.0,
         "supertree_width": float(max_supertree_width) if pruned else 0.0,
         "supertree_node_count": float(supertree_node_count),
@@ -1291,12 +909,10 @@ def dartree_generate(
     supertree_width: int,
     correction_scorer: DominoCorrectionScorer,
     candidate_vocab_size: int,
-    score_select_graph: DARTreeScoreSelectGraph,
     temperature: float,
     stop_token_ids: list[int] | None,
     ngram_model: Any | None = None,
     ngram_weight: float = 0.0,
-    use_dart_level_weights: bool = False,
     record_round_trace: bool = False,
     record_entropy: bool = False,
     verify_buffer_nodes: int = 0,
@@ -1569,16 +1185,10 @@ def dartree_generate(
             correction_scorer=correction_scorer,
             z_parts=z_parts,
             candidate_tables=candidate_tables,
-            score_select_graph=score_select_graph,
             tree_buffers=tree_buffers,
             pruned=(variant == "pruned"),
             ngram_model=ngram_model,
             ngram_weight=ngram_weight,
-            use_dart_level_weights=use_dart_level_weights,
-            allow_fused_select=(
-                not use_dart_level_weights
-                and not (ngram_weight > 0 and ngram_model is not None)
-            ),
             detail_times=detail_times,
         )
         tree_build_elapsed = cuda_time(device) - tree_start
@@ -2034,15 +1644,10 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Weight of the DART-style n-gram continuity term in tree "
             "scoring (Algorithm 1). 0 disables it (ablation baseline); "
-            "0.5 is DART's default. The n-gram model itself is not wired "
-            "yet -- a NoopNgram placeholder is used, so the term is 0."
-        ),
-    )
-    parser.add_argument(
-        "--use-dart-level-weights", action="store_true",
-        help=(
-            "Apply DART's per-level weights w_level=(level+1)**-0.7 and "
-            "w_logit=0.9**level to the per-level score increment."
+            "0.5 is DART's default. When > 0 the full DART scoring "
+            "(w_level/w_logit/ngram weights) is used; the n-gram model "
+            "itself is not wired yet -- a NoopNgram placeholder is used, "
+            "so the term is 0."
         ),
     )
     parser.add_argument(
@@ -2226,44 +1831,6 @@ def main() -> None:
         if args.variant == "pruned"
         else None
     )
-    construction_budget = (
-        sum(per_layer_widths)
-        if per_layer_widths is not None
-        else int(args.tree_budget)
-    )
-    planned_pairs = planned_score_select_pairs(
-        budget=construction_budget,
-        depth_limit=k_draft,
-        candidate_count=expansion_k,
-        per_layer_widths=per_layer_widths,
-    )
-    planned_max_batch = max(
-        (
-            batch_size
-            for batch_size, _selected in planned_pairs
-        ),
-        default=1,
-    )
-    planned_max_select = max(
-        (
-            selected
-            for _batch_size, selected in planned_pairs
-        ),
-        default=1,
-    )
-    score_select_graph = (
-        DARTreeScoreSelectGraph(
-            correction_scorer,
-            device=device,
-            max_batch=planned_max_batch,
-            candidate_count=candidate_vocab_size,
-            select_candidate_count=expansion_k,
-            max_select=planned_max_select,
-            dtype=next(draft_model.parameters()).dtype,
-            include_gru=True,
-            warm_pairs=sorted(planned_pairs),
-        )
-    )
 
     dataset = load_and_process_dataset(args.dataset)
     if args.max_samples is not None:
@@ -2351,16 +1918,12 @@ def main() -> None:
                 supertree_width=args.supertree_width,
                 correction_scorer=correction_scorer,
                 candidate_vocab_size=args.candidate_vocab_size,
-                score_select_graph=score_select_graph,
                 temperature=args.temperature,
                 stop_token_ids=[
                     tokenizer.eos_token_id
                 ],
                 ngram_model=ngram_model,
                 ngram_weight=args.ngram_weight,
-                use_dart_level_weights=(
-                    args.use_dart_level_weights
-                ),
                 record_round_trace=(
                     args.record_round_trace
                 ),
