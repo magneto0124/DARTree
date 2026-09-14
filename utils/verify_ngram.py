@@ -73,7 +73,7 @@ Node = Tuple[int, int, int]  # (token, parent, freq)
 
 
 def _unpack(fmt: str, f) -> int:
-    return struct.unpack(fmt, f.read(struct.sizeof(fmt)))[0]
+    return struct.unpack(fmt, f.read(struct.calcsize(fmt)))[0]
 
 
 def parse_trie_raw(
