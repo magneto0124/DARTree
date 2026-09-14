@@ -338,10 +338,51 @@ def build_visibility(parents: list[int]) -> torch.Tensor:
     return torch.from_numpy(visibility_np)
 
 
+def _ngram_contexts(
+    *,
+    child_depth: int,
+    parent_indices: torch.Tensor,
+    tokens_t: torch.Tensor,
+    parents_t: torch.Tensor,
+    root_token_id: torch.Tensor,
+    prev_root_token_id: torch.Tensor | None,
+    order: int,
+) -> list[list[int]]:
+    """Per-parent n-gram contexts of length ``order - 1`` (oldest first).
+
+    DART's searcher uses the last ``order - 1`` tokens of each candidate
+    path as the n-gram context.  For a node created at ``child_depth`` the
+    path suffix is the ancestor chain of its parent (frontier) node; when
+    the tree ancestry runs out we pad with the accepted-prefix tail -- the
+    round root token and, at the first level, the token before it (DART
+    prepends the prompt suffix in the same situation).
+    """
+    ctx_len = max(0, order - 1)
+    root_value = int(root_token_id)
+    prev_value = (
+        int(prev_root_token_id) if prev_root_token_id is not None else None
+    )
+    contexts: list[list[int]] = []
+    for parent_node in parent_indices.tolist():
+        chain: list[int] = []  # newest -> oldest
+        node = int(parent_node)
+        while len(chain) < ctx_len and node > 0:
+            # token of node j lives at tokens_t[j - 1]
+            chain.append(int(tokens_t[node - 1]))
+            node = int(parents_t[node])
+        if len(chain) < ctx_len:
+            chain.append(root_value)
+        if len(chain) < ctx_len and prev_value is not None:
+            chain.append(prev_value)
+        contexts.append(list(reversed(chain)))
+    return contexts
+
+
 @torch.inference_mode()
 def build_dartree_supertree(
     *,
     root_token_id: torch.Tensor,
+    prev_root_token_id: torch.Tensor | None = None,
     parallel_hiddens: torch.Tensor,
     base_logits: torch.Tensor,
     budget: int,
@@ -594,23 +635,30 @@ def build_dartree_supertree(
         #   score += w_level * (w_logit * s_logit + w_ngram * s_ngram)
         # with w_level = (level+1)**-0.7, w_logit = 0.9**level and
         # w_ngram = ngram_weight; s_ngram = log(Pr_ngram(t | ctx) + eps).
-        # ctx is the node's path suffix (the parent token for a 2-gram),
-        # falling back to the root token for the first level, exactly like
-        # DART's searcher falls back to the prompt suffix.
-        # This is 2-gram implementation.
+        # ctx is the candidate path's last (order-1) tokens: the parent's
+        # ancestor chain, padded with the accepted-prefix tail (round root
+        # token and the token before it) when the tree ancestry runs out --
+        # exactly like DART's searcher prepends the prompt suffix.
+        # This is the full-window 3-gram implementation (window length comes
+        # from the loaded trie's order; the C++ model degrades to a shorter
+        # match when a longer context is unseen).
         if ngram_model is not None and ngram_weight > 0:
             level = child_depth - 1
             w_level = (float(level) + 1.0) ** -0.7
             w_logit = 0.9 ** float(level)
-            parent_tokens = (
-                [int(root_token_id)] * int(parent_count)
-                if child_depth == 1
-                else tokens_t[parent_indices - 1].cpu().tolist()
+            ngram_ctx = _ngram_contexts(
+                child_depth=child_depth,
+                parent_indices=parent_indices,
+                tokens_t=tokens_t,
+                parents_t=parents_t,
+                root_token_id=root_token_id,
+                prev_root_token_id=prev_root_token_id,
+                order=int(ngram_model.order),
             )
             cand_ids = top_ids.cpu().tolist()
             ngram_rows = []
-            for ctx, cands in zip(parent_tokens, cand_ids):
-                probs, _matched = ngram_model.get_probability([ctx], list(cands))
+            for ctx, cands in zip(ngram_ctx, cand_ids):
+                probs, _matched = ngram_model.get_probability(ctx, list(cands))
                 ngram_rows.append([float(p) for p in probs])
             p_ng = torch.tensor(ngram_rows, dtype=top_scores.dtype, device=top_scores.device,)
             s_ng = torch.log(p_ng + ngram_eps)
@@ -1026,6 +1074,13 @@ def dartree_generate(
         round_root_token_value = int(
             round_root_token_id.detach().cpu().item()
         )
+        # token right before the round root -- the last accepted token before
+        # this round -- used as the n-gram context tail for the first level.
+        prev_round_root_token_id = (
+            output_ids[0, start - 1].detach().clone()
+            if start >= 1
+            else round_root_token_id
+        )
 
         draft_start = cuda_time(device)
         t_draft_embed = detail_start(detail_times, device)
@@ -1164,6 +1219,7 @@ def dartree_generate(
             tree_stats,
         ) = build_dartree_supertree(
             root_token_id=round_root_token_id,
+            prev_root_token_id=prev_round_root_token_id,
             parallel_hiddens=parallel_hiddens[
                 :, :k_draft, :
             ],
