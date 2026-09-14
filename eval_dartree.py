@@ -24,7 +24,6 @@ from utils import (
     DominoCorrectionScorer,
     DraftCorrectionGraphRunner,
     NgramModel,
-    NoopNgram,
     cuda_time,
     load_and_process_dataset,
     logits_entropy,
@@ -1643,9 +1642,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ngram-model", type=str, default=None,
         help=(
-            "Path (or repo id) of a serialised n-gram model to load via "
-            "NgramModel.from_path. The concrete loader is not implemented "
-            "yet -- the interface returns a NoopNgram placeholder."
+            "Path to a DART-format .trie n-gram model, loaded via "
+            "NgramModel.from_path (C++ TrieNgram extension, "
+            "utils/ngram_cpp). Published models: "
+            "hf.co/fvliang/dart-qwen3-ngram (full.trie / small.trie). "
+            "Ignored unless --ngram-weight > 0."
         ),
     )
     parser.add_argument(
@@ -1654,9 +1655,9 @@ def parse_args() -> argparse.Namespace:
             "Weight of the DART-style n-gram continuity term in tree "
             "scoring (Algorithm 1). 0 disables it (ablation baseline); "
             "0.5 is DART's default. When > 0 the full DART scoring "
-            "(w_level/w_logit/ngram weights) is used; the n-gram model "
-            "itself is not wired yet -- a NoopNgram placeholder is used, "
-            "so the term is 0."
+            "(w_level/w_logit/ngram weights) is used with "
+            "s_ngram = log(Pr_ngram(t | ctx) + eps), and --ngram-model "
+            "must point at a .trie file."
         ),
     )
     parser.add_argument(
@@ -1820,21 +1821,17 @@ def main() -> None:
 
     ngram_model = None
     if float(args.ngram_weight) > 0:
-        if args.ngram_model:
-            ngram_model = NgramModel.from_path(args.ngram_model)
-            print(
-                f"[ngram] loading n-gram model from {args.ngram_model} "
-                "(from_path placeholder -- no-op until implemented)."
+        if not args.ngram_model or args.ngram_model == "None":
+            raise ValueError(
+                "--ngram-weight > 0 requires --ngram-model pointing at a "
+                "DART-format .trie file (e.g. from "
+                "hf.co/fvliang/dart-qwen3-ngram)."
             )
-        else:
-            # Placeholder until the real 2-gram table lands: it contributes
-            # an all-zero n-gram term, so the DART-style scoring path is
-            # exercised end-to-end with no behavioural change.
-            ngram_model = NoopNgram()
-            print(
-                "[ngram] --ngram-weight > 0 but no --ngram-model given; "
-                "using NoopNgram placeholder (n-gram term = 0)."
-            )
+        ngram_model = NgramModel.from_path(args.ngram_model)
+        print(
+            f"[ngram] loaded n-gram model from {args.ngram_model} "
+            f"(order={ngram_model.order})"
+        )
 
     candidate_vocab_size = int(args.candidate_vocab_size)
     expansion_k = min(

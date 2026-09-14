@@ -6,9 +6,10 @@ from .draft_model import (
     logits_entropy,
     sample,
 )
-from .ngram import NgramModel, NoopNgram
+from .ngram import CppTrieNgram, NgramModel, NoopNgram
 
 __all__ = [
+    "CppTrieNgram",
     "DFlashDraftModel",
     "DominoCorrectionScorer",
     "DraftCorrectionGraphRunner",

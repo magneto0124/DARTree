@@ -1,15 +1,18 @@
 """N-gram interface for DART-style continuity-aware tree scoring.
 
 The tree-expansion scorer in ``eval_dartree.build_dartree_supertree`` consumes
-an object exposing :class:`NgramModel`.  The concrete 2-gram table is filled
-in later; :class:`NoopNgram` is the placeholder so the DART-style scoring path
-can be wired up and exercised end-to-end right now (it contributes an
-all-zero n-gram term, so selection is unaffected).
+an object exposing :class:`NgramModel`.  The concrete implementation is
+:class:`CppTrieNgram`, which wraps DART's C++ ``TrieNgram`` extension
+(``utils/ngram_cpp``): it is binary-compatible with DART's ``.trie`` files, so
+models published for DART (e.g. ``fvliang/dart-qwen3-ngram`` with
+``full.trie`` / ``small.trie``) load as-is.  :class:`NoopNgram` remains as an
+all-zero fallback for callers that want to exercise the scoring path without a
+model.
 """
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Sequence
+from typing import Any, Sequence
 
 
 class NgramModel(ABC):
@@ -25,16 +28,14 @@ class NgramModel(ABC):
 
     @classmethod
     def from_path(cls, path: str) -> "NgramModel":
-        """Load an n-gram model from ``path``.
+        """Load an n-gram model from ``path`` (DART ``.trie`` binary format).
 
-        Placeholder only: the concrete 2-gram table loader is not implemented
-        yet, so this returns a :class:`NoopNgram` to let speculative-decoding
-        code call through this interface end-to-end.  Concrete subclasses
-        (e.g. a future 2-gram table) must override this method with their own
-        loader.
+        Delegates to :class:`CppTrieNgram`, which wraps DART's C++ extension.
+        The extension is JIT-compiled on first use, so this requires torch and
+        a C++20 compiler with OpenMP on the host; failures are re-raised with
+        a hint.
         """
-        del path  # unused placeholder
-        return NoopNgram()
+        return CppTrieNgram.from_path(path)
 
     @abstractmethod
     def get_probability(
@@ -50,6 +51,49 @@ class NgramModel(ABC):
         ``logf(score + 1e-10f)``.
         """
         raise NotImplementedError
+
+
+class CppTrieNgram(NgramModel):
+    """DART's C++ ``TrieNgram`` behind the :class:`NgramModel` API.
+
+    The underlying pybind11 extension (``utils/ngram_cpp``) is JIT-compiled on
+    first use via ``torch.utils.cpp_extension.load`` and cached on disk.  It
+    implements a longest-match context walk: for a context of length L it
+    scores candidates against the longest suffix (up to ``order - 1`` tokens)
+    found in the trie, with raw MLE probabilities ``freq(child) / freq(ctx)``.
+    """
+
+    def __init__(self, model: Any) -> None:
+        self._model = model
+        self.order = int(model.get_order())
+
+    @classmethod
+    def from_path(cls, path: str) -> "CppTrieNgram":
+        try:
+            # Lazy import: the first call triggers the one-time JIT build of
+            # the C++ extension (requires torch + a C++20 compiler).
+            from utils.ngram_cpp import load_cpp_ngram
+
+            cpp_ngram = load_cpp_ngram()
+            model = cpp_ngram.TrieNgram.load(path)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to load n-gram model from {path!r} via the C++ "
+                "TrieNgram extension. Check that the .trie file exists and "
+                "that the host has torch and a C++20 compiler with OpenMP "
+                "(the extension is JIT-compiled on first use)."
+            ) from exc
+        return cls(model)
+
+    def get_probability(
+        self,
+        context: Sequence[int],
+        tokens: Sequence[int],
+    ) -> tuple[list[float], list[int]]:
+        probs, matched_lengths = self._model.get_probability(
+            list(context), list(tokens)
+        )
+        return [float(p) for p in probs], [int(m) for m in matched_lengths]
 
 
 class NoopNgram(NgramModel):

@@ -65,3 +65,38 @@ Use `--variant fixed` to evaluate **DARTree (fixed)**.
 The default configuration uses a draft block size of 16, a verification budget of 64 nodes, 64 candidate tokens per position, a supertree width of 12 for the pruned variant, and `max_new_tokens=2048`. Default sample counts for each benchmark are specified in `run_dartree.py`.
 
 Each evaluation produces a result file containing per-example generated token IDs, acceptance lengths, timing statistics, and an aggregate summary.
+
+## Optional n-gram continuity scoring
+
+DARTree can add DART's n-gram continuity term to tree scoring (Algorithm 1,
+`w_level * (w_logit * logit + w_ngram * log(Pr_ngram(t | ctx) + eps))`):
+
+```bash
+python run_dartree.py \
+  --target-model Qwen/Qwen3-4B \
+  --draft-model Huang2020/Qwen3-4B-Domino-b16 \
+  --dataset gsm8k \
+  --variant pruned \
+  --temperature 0 \
+  --ngram-model /path/to/small.trie \
+  --ngram-weight 0.5
+```
+
+* `--ngram-model` is a DART-format `.trie` file loaded through the C++
+  `TrieNgram` extension (`utils/ngram_cpp`, binary-compatible with DART's
+  format). Published models are available at
+  [hf.co/fvliang/dart-qwen3-ngram](https://huggingface.co/fvliang/dart-qwen3-ngram)
+  (`full.trie`, and `small.trie` for fast testing — start with `small.trie`).
+* `--ngram-weight` sets the weight of the n-gram term; `0.5` is DART's
+  default, `0` disables it (ablation baseline). When `> 0`, `--ngram-model`
+  is required.
+* The C++ extension is JIT-compiled on first use via
+  `torch.utils.cpp_extension.load` (requires a C++20 compiler with OpenMP on
+  the host) and is then cached under `~/.cache/torch_extensions`.
+* To build your own `.trie` from JSONL (`{"text": ...}` per line) or from a
+  DARTree dataset, use:
+
+  ```bash
+  python utils/ngram_build.py --data /path/to/jsonl_dir \
+    --output-path /path/to/out --ngram-order 3 --n-jobs 16
+  ```

@@ -73,10 +73,11 @@ def main() -> None:
         "--candidate-vocab-size", str(args.candidate_k),
         "--temperature", str(args.temperature),
         "--device", args.device,
-        "--ngram-model", str(args.ngram_model),
         "--ngram-weight", str(args.ngram_weight),
         "--output", output,
     ]
+    if args.ngram_model:
+        engine_args += ["--ngram-model", args.ngram_model]
     if args.variant == "fixed":
         engine_args += [
             "--depth-bonus", "0",
