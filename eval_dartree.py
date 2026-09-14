@@ -23,6 +23,7 @@ from utils import (
     DFlashDraftModel,
     DominoCorrectionScorer,
     DraftCorrectionGraphRunner,
+    NgramModel,
     NoopNgram,
     cuda_time,
     load_and_process_dataset,
@@ -1640,6 +1641,14 @@ def parse_args() -> argparse.Namespace:
         "--depth-bonus", type=float
     )
     parser.add_argument(
+        "--ngram-model", type=str, default=None,
+        help=(
+            "Path (or repo id) of a serialised n-gram model to load via "
+            "NgramModel.from_path. The concrete loader is not implemented "
+            "yet -- the interface returns a NoopNgram placeholder."
+        ),
+    )
+    parser.add_argument(
         "--ngram-weight", type=float, default=0.0,
         help=(
             "Weight of the DART-style n-gram continuity term in tree "
@@ -1811,14 +1820,21 @@ def main() -> None:
 
     ngram_model = None
     if float(args.ngram_weight) > 0:
-        # Placeholder until the real 2-gram table lands: it contributes an
-        # all-zero n-gram term, so the DART-style scoring path is exercised
-        # end-to-end with no behavioural change.
-        ngram_model = NoopNgram()
-        print(
-            "[ngram] --ngram-weight > 0 but no n-gram model is wired yet; "
-            "using NoopNgram placeholder (n-gram term = 0)."
-        )
+        if args.ngram_model:
+            ngram_model = NgramModel.from_path(args.ngram_model)
+            print(
+                f"[ngram] loading n-gram model from {args.ngram_model} "
+                "(from_path placeholder -- no-op until implemented)."
+            )
+        else:
+            # Placeholder until the real 2-gram table lands: it contributes
+            # an all-zero n-gram term, so the DART-style scoring path is
+            # exercised end-to-end with no behavioural change.
+            ngram_model = NoopNgram()
+            print(
+                "[ngram] --ngram-weight > 0 but no --ngram-model given; "
+                "using NoopNgram placeholder (n-gram term = 0)."
+            )
 
     candidate_vocab_size = int(args.candidate_vocab_size)
     expansion_k = min(

@@ -23,6 +23,19 @@ class NgramModel(ABC):
 
     order: int
 
+    @classmethod
+    def from_path(cls, path: str) -> "NgramModel":
+        """Load an n-gram model from ``path``.
+
+        Placeholder only: the concrete 2-gram table loader is not implemented
+        yet, so this returns a :class:`NoopNgram` to let speculative-decoding
+        code call through this interface end-to-end.  Concrete subclasses
+        (e.g. a future 2-gram table) must override this method with their own
+        loader.
+        """
+        del path  # unused placeholder
+        return NoopNgram()
+
     @abstractmethod
     def get_probability(
         self,

@@ -33,6 +33,7 @@ def main() -> None:
     parser.add_argument("--candidate-k", type=int, default=64)
     parser.add_argument("--supertree-width", type=int, default=12)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--ngram-model", default=None)
     parser.add_argument("--ngram-weight", type=float, default=0.0)
     parser.add_argument("--output")
     parser.add_argument("--record-round-trace", action="store_true")
@@ -72,6 +73,7 @@ def main() -> None:
         "--candidate-vocab-size", str(args.candidate_k),
         "--temperature", str(args.temperature),
         "--device", args.device,
+        "--ngram-model", str(args.ngram_model),
         "--ngram-weight", str(args.ngram_weight),
         "--output", output,
     ]
