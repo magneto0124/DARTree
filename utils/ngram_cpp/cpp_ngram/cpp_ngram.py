@@ -26,7 +26,7 @@ def load_cpp_ngram():
             sources=[
                 f"{_abs_path}/ngram_binding.cpp",
                 f"{_abs_path}/trie_ngram.cpp",
-                f"{_abs_path}/cpp_utils/buffered_file_reader.cpp",
+                f"{_abs_path}/../cpp_utils/buffered_file_reader.cpp",
             ],
             extra_cflags=[
                 "-O3",
