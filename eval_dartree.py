@@ -597,6 +597,7 @@ def build_dartree_supertree(
         # ctx is the node's path suffix (the parent token for a 2-gram),
         # falling back to the root token for the first level, exactly like
         # DART's searcher falls back to the prompt suffix.
+        # This is 2-gram implementation.
         if ngram_model is not None and ngram_weight > 0:
             level = child_depth - 1
             w_level = (float(level) + 1.0) ** -0.7
