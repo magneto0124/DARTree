@@ -597,8 +597,6 @@ def build_dartree_supertree(
         # ctx is the node's path suffix (the parent token for a 2-gram),
         # falling back to the root token for the first level, exactly like
         # DART's searcher falls back to the prompt suffix.
-        # Active only when an n-gram model is wired; otherwise the score
-        # stays exactly the original DARTree logit score (unchanged).
         if ngram_model is not None and ngram_weight > 0:
             level = child_depth - 1
             w_level = (float(level) + 1.0) ** -0.7
@@ -611,19 +609,11 @@ def build_dartree_supertree(
             cand_ids = top_ids.cpu().tolist()
             ngram_rows = []
             for ctx, cands in zip(parent_tokens, cand_ids):
-                probs, _matched = ngram_model.get_probability(
-                    [ctx], list(cands)
-                )
+                probs, _matched = ngram_model.get_probability([ctx], list(cands))
                 ngram_rows.append([float(p) for p in probs])
-            p_ng = torch.tensor(
-                ngram_rows,
-                dtype=top_scores.dtype,
-                device=top_scores.device,
-            )
+            p_ng = torch.tensor(ngram_rows, dtype=top_scores.dtype, device=top_scores.device,)
             s_ng = torch.log(p_ng + ngram_eps)
-            top_scores = w_level * (
-                w_logit * top_scores + ngram_weight * s_ng
-            )
+            top_scores = w_level * (w_logit * top_scores + ngram_weight * s_ng)
 
         t_select = detail_start(detail_times, device)
         scored_candidate_count = int(top_scores.shape[1])
