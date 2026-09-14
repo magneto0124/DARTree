@@ -9,22 +9,22 @@ Run on the evaluation machine (needs transformers + the C++ extension):
         --tokenizer Qwen/Qwen3-4B \
         --draft-tokenizer Huang2020/Qwen3-4B-Domino-b16
 
-Checks performed:
+Checks:
 
-1. trie order (read from the .trie header).
+1. trie order (from the .trie header).
 2. tokenizer id-space identity between --tokenizer and --draft-tokenizer
-   (vocab size + per-token id spot check) -- the eval queries the trie with
-   token ids produced by the draft model, so both sides must agree.
+   (vocab size + per-token id spot check).  The eval feeds the trie with token
+   ids produced by the DRAFT model's logits, so both sides must agree.
 3. coverage: tokenize real text (math / code / prose) and, for every
-   consecutive n-gram window (ctx length 1 .. order-1), query the trie and
-   count how often the next token has p > 0.  A correct Qwen3 tokenizer / trie
-   pairing shows high coverage at ctx length 1; near-zero coverage means the
-   id spaces do not match.
-4. top-5 continuations per context, decoded back to text, for a human
-   eyeball check.
+   consecutive n-gram window (ctx length 1 .. order-1), count how often the
+   next token has p > 0.  High 1-token coverage => same id space; near-zero =>
+   mismatch.
+4. canary probes: top-N continuations (with p values, and the actual queried
+   context decoded) for contexts that certainly occur in the training corpus,
+   at both 1-token and (order-1)-token context lengths.
 5. determinism and value-range sanity.
 
-Exit code 0 = all checks passed; 1 = a hard failure was found.
+Exit code 0 = all checks passed; 1 = hard failure.
 """
 
 from __future__ import annotations
@@ -45,16 +45,27 @@ DEFAULT_SNIPPETS: List[str] = [
     ),
 ]
 
+# Contexts whose (order-1)-token tails are guaranteed common in a general
+# web corpus, so a correctly-aligned trie MUST return real continuations.
 CANARY_CONTEXTS: List[str] = [
-    "The capital of France is",
     "the answer is",
+    "I think",
+    "in order to",
+    "one of the most",
+]
+
+COMMON_PROBES: List[str] = [
+    " the",
+    " is",
+    " answer",
+    " of",
 ]
 
 
 def check_vocab_identity(
     tokenizer_name: str,
     draft_tokenizer_name: Optional[str],
-) -> Tuple[Optional[dict], List[str]]:
+) -> Tuple[dict, List[str]]:
     """Compare the id spaces of the eval tokenizers; return (vocab, problems)."""
     from transformers import AutoTokenizer
 
@@ -78,9 +89,7 @@ def check_vocab_identity(
                 )
             else:
                 sample = list(vocab.keys())[:5000]
-                mism = sum(
-                    1 for t in sample if vocab[t] != dvocab.get(t)
-                )
+                mism = sum(1 for t in sample if vocab[t] != dvocab.get(t))
                 print(
                     f"[vocab] spot-checked {len(sample)} tokens: "
                     f"{mism} id mismatches"
@@ -128,18 +137,40 @@ def check_coverage(model, tok, order: int, snippets: List[str]) -> List[str]:
     return problems
 
 
-def check_top_continuations(model, tok, vocab, order: int) -> None:
-    """Print the trie's most likely continuations for human inspection."""
-    print("\n[top-5 continuations] (human eyeball check)")
+def _print_top(model, tok, vocab, ctx: List[int], k: int = 5) -> None:
+    """Query the trie over the full vocab and print the top-k continuations."""
+    probs, matched = model.get_probability(ctx, sorted(vocab.values()))
+    ranked = sorted(zip(probs, matched, sorted(vocab.values())), reverse=True)
+    if ranked[0][0] <= 0.0:
+        print("      -> NO MATCH (all p = 0): the queried context does not "
+              "exist in this trie's id space.")
+        return
+    for p, m, tid in ranked[:k]:
+        print(f"      p={p:.4f} (matched_len={m}) {tok.decode([tid])!r}")
+
+
+def check_canaries(model, tok, vocab, order: int) -> None:
+    """Query guaranteed-common contexts at both 1-token and full-window
+    lengths, so we can see whether the trie 'understands' real text."""
+    print("\n[canary probes] (query the trie over the full vocab)")
     vocab_ids = sorted(vocab.values())
     for text in CANARY_CONTEXTS:
         ids = tok.encode(text, add_special_tokens=False)
-        ctx = ids[-(order - 1):]
-        probs, _matched = model.get_probability(ctx, vocab_ids)
-        ranked = sorted(zip(probs, vocab_ids), reverse=True)[:5]
-        print(f"  ctx={text!r}")
-        for p, tid in ranked:
-            print(f"    p={p:.4f}  {tok.decode([tid])!r}")
+        print(f"  text={text!r}  ->  tokens={[tok.decode([t]) for t in ids]!r}")
+        for L in range(1, min(order, len(ids) + 1)):
+            ctx = ids[-L:]
+            print(f"    ctx_len={L}: ctx={tok.decode(ctx)!r}")
+            _print_top(model, tok, vocab, ctx, k=5)
+
+
+def check_common_probes(model, tok, vocab, order: int) -> None:
+    """1-token probes on the most common English tokens."""
+    print("\n[common-token probes] (1-token context, top-10)")
+    for probe in COMMON_PROBES:
+        ids = tok.encode(probe, add_special_tokens=False)
+        ctx = ids[:1]
+        print(f"  ctx={tok.decode(ctx)!r}")
+        _print_top(model, tok, vocab, ctx, k=10)
 
 
 def check_sanity(model, tok, vocab, order: int) -> List[str]:
@@ -197,7 +228,8 @@ def main() -> None:
     snippets: List[str] = list(args.text) if args.text else DEFAULT_SNIPPETS
     problems += check_coverage(model, tok, order, snippets)
 
-    check_top_continuations(model, tok, vocab, order)
+    check_canaries(model, tok, vocab, order)
+    check_common_probes(model, tok, vocab, order)
     problems += check_sanity(model, tok, vocab, order)
 
     print()
