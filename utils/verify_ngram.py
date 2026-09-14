@@ -16,23 +16,23 @@ Checks:
 
 1. parse the .trie binary directly (struct, little-endian) -- independent of
    the C++ extension;
-2. DECISIVE: decode the trie's most frequent token ids with --tokenizer
-   (and also with --draft-tokenizer, if given) and compare the decoded words;
+2. DECISIVE: decode the trie's most frequent token ids with --tokenizer (the
+   ONLY tokenizer in the eval pipeline -- eval_dartree.py tokenizes everything
+   with the target model's tokenizer, and the Domino draft head outputs logits
+   over the target model's vocab, so there is no separate draft tokenizer);
 3. trie order / node_count from the raw file vs the C++ API (cross-check the
    C++ loader's header handling);
 4. id-range: all root-child token ids must lie inside the target vocab;
 5. spot-check a few conditional probabilities computed by hand from the raw
    file against the C++ get_probability output (independent "lookup is not
    wrong" evidence);
-6. supporting checks: draft-vs-target vocab identity, coverage, canaries,
-   determinism/range.
+6. supporting checks: coverage, canaries, determinism/range.
 
 Usage:
 
     python utils/verify_ngram.py \
         --ngram-model /path/to/small.trie \
-        --tokenizer Qwen/Qwen3-4B \
-        --draft-tokenizer Huang2020/Qwen3-4B-Domino-b16
+        --tokenizer Qwen/Qwen3-4B
 
 Exit code 0 = all checks passed; 1 = hard failure.
 """
@@ -240,46 +240,14 @@ def check_conditional_spot(
 
 def check_vocab_identity(
     tokenizer_name: str,
-    draft_tokenizer_name: Optional[str],
 ) -> Tuple[dict, List[str]]:
+    """Load the eval tokenizer; return (vocab, problems)."""
     from transformers import AutoTokenizer
 
-    problems: List[str] = []
     tok = AutoTokenizer.from_pretrained(tokenizer_name)
     vocab = tok.get_vocab()
-    print(f"[vocab] target tokenizer {tokenizer_name!r}: size = {len(vocab)}")
-
-    if draft_tokenizer_name:
-        try:
-            dtok = AutoTokenizer.from_pretrained(draft_tokenizer_name)
-            dvocab = dtok.get_vocab()
-            print(
-                f"[vocab] draft tokenizer {draft_tokenizer_name!r}: "
-                f"size = {len(dvocab)}"
-            )
-            if len(vocab) != len(dvocab):
-                problems.append(
-                    f"vocab size mismatch: target {len(vocab)} vs "
-                    f"draft {len(dvocab)}"
-                )
-            else:
-                sample = list(vocab.keys())[:5000]
-                mism = sum(1 for t in sample if vocab[t] != dvocab.get(t))
-                print(
-                    f"[vocab] spot-checked {len(sample)} tokens: "
-                    f"{mism} id mismatches"
-                )
-                if mism:
-                    problems.append(
-                        "token->id mapping differs between target and "
-                        "draft tokenizers"
-                    )
-        except Exception as exc:  # noqa: BLE001
-            print(
-                f"[vocab] WARNING: could not load draft tokenizer "
-                f"{draft_tokenizer_name!r}: {exc}"
-            )
-    return vocab, problems
+    print(f"[vocab] eval tokenizer {tokenizer_name!r}: size = {len(vocab)}")
+    return vocab, []
 
 
 def check_coverage(model, tok, order: int, snippets: List[str]) -> List[str]:
@@ -376,9 +344,8 @@ def main() -> None:
     parser.add_argument("--ngram-model", required=True,
                         help="Path to a DART-format .trie file.")
     parser.add_argument("--tokenizer", default="Qwen/Qwen3-4B",
-                        help="Tokenizer used at eval time (target model).")
-    parser.add_argument("--draft-tokenizer", default=None,
-                        help="Draft model tokenizer (eval feeds draft ids).")
+                        help="Tokenizer used at eval time (target model; the "
+                             "eval pipeline has no separate draft tokenizer).")
     parser.add_argument("--text", action="append", default=None,
                         help="Extra sample text (repeatable).")
     parser.add_argument("--max-parse-nodes", type=int, default=5_000_000,
@@ -406,16 +373,6 @@ def main() -> None:
         root_children, node_info, tok, vocab_size, args.tokenizer
     )
 
-    if args.draft_tokenizer:
-        try:
-            dtok = AutoTokenizer.from_pretrained(args.draft_tokenizer)
-            problems += check_root_children_decode(
-                root_children, node_info, dtok, len(dtok.get_vocab()),
-                args.draft_tokenizer,
-            )
-        except Exception as exc:  # noqa: BLE001
-            print(f"[raw] WARNING: could not decode with draft tokenizer: {exc}")
-
     # --- C++ extension checks ----------------------------------------------
     model = NgramModel.from_path(args.ngram_model)
     order = int(model.order)
@@ -426,9 +383,7 @@ def main() -> None:
             f"({order_raw})"
         )
 
-    vocab2, vocab_problems = check_vocab_identity(
-        args.tokenizer, args.draft_tokenizer
-    )
+    _vocab, vocab_problems = check_vocab_identity(args.tokenizer)
     problems += vocab_problems
 
     snippets: List[str] = list(args.text) if args.text else DEFAULT_SNIPPETS
