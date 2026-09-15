@@ -454,6 +454,12 @@ def _ngram_contexts(
     return contexts
 
 
+# Per-order discount applied to ngram candidate probabilities before scoring:
+# index = ngram order of the match (0 = no match, 2 = bigram backoff,
+# 3 = trigram), so a probability from a shorter (backed-off) match is
+# down-weighted relative to a full trigram match.
+ratio = [0.0, 0.2, 0.8]
+
 @torch.inference_mode()
 def build_dartree_supertree(
     *,
@@ -758,11 +764,25 @@ def build_dartree_supertree(
             for ctx, cands in zip(ngram_ctx, cand_ids):
                 probs, matched = ngram_model.get_probability(ctx, list(cands))
                 ngram_rows.append([float(p) for p in probs])
-                if record_rank_pairs:
-                    # matched length per candidate: 2 = trigram context hit,
-                    # 1 = bigram backoff, 0 = no match (probability 0)
-                    matched_rows.append([int(m) for m in matched])
+                # matched length per candidate: 2 = trigram context hit,
+                # 1 = bigram backoff, 0 = no match (probability 0)
+                matched_rows.append([int(m) for m in matched])
             p_ng = torch.tensor(ngram_rows, dtype=top_scores.dtype, device=top_scores.device,)
+            # Order-aware correction: scale every probability by the ratio of
+            # the ngram order that produced it (ratio[0] = no match,
+            # ratio[2] = bigram, ratio[3] = trigram) so mixed-order scores
+            # stay comparable.
+            p_ng = p_ng * torch.tensor(
+                [
+                    [
+                        ratio[max(int(m), 0)]
+                        for m in row
+                    ]
+                    for row in matched_rows
+                ],
+                dtype=p_ng.dtype,
+                device=p_ng.device,
+            )
             s_ng = torch.log(p_ng + ngram_eps)
             if record_rank_pairs:
                 rank_levels[-1]["ngram_probs"] = p_ng.detach().cpu().tolist()
