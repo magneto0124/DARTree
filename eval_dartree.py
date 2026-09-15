@@ -1745,11 +1745,14 @@ def save_rank_pairs(
     xs = [int(p["draft_rank"]) for p in pairs]
     ys = [int(p["ngram_rank"]) for p in pairs]
     limit = max(max(xs), max(ys), 1)
+    # start the axes below rank 1 so points clustered at (1, 1) are not
+    # glued to the edges; the y = x diagonal spans the full plot
+    lo = -1.0
     fig, ax = plt.subplots(figsize=(6, 6))
     ax.scatter(xs, ys, s=12, alpha=0.6, edgecolors="none")
     ax.plot(
-        [1, limit],
-        [1, limit],
+        [lo, limit],
+        [lo, limit],
         "r--",
         linewidth=1,
         label="y = x",
@@ -1757,8 +1760,8 @@ def save_rank_pairs(
     ax.set_xlabel("draft top-k rank of accepted token")
     ax.set_ylabel("ngram top-k rank of accepted token")
     ax.set_title(f"accepted-token ranks (n={len(pairs)})")
-    ax.set_xlim(1, limit)
-    ax.set_ylim(1, limit)
+    ax.set_xlim(lo, limit)
+    ax.set_ylim(lo, limit)
     ax.grid(True, alpha=0.3)
     ax.legend()
     fig.tight_layout()
