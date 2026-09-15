@@ -12,21 +12,24 @@ def load_and_process_dataset(data_name: str):
         )
         dataset = dataset.map(lambda x: {"turns": [prompt.format(**x)]})
     elif data_name == "math500":
-        dataset = load_dataset("HuggingFaceH4/MATH-500", split="test")
+        # dataset = load_dataset("HuggingFaceH4/MATH-500", split="test")
+        dataset = load_dataset("json", data_files={"test": "/home/l00937960/dataset/MATH-500/test.jsonl"}, split="test")
         prompt = (
             "{problem}\nPlease reason step by step, and put your final answer "
             "within \\boxed{{}}."
         )
         dataset = dataset.map(lambda x: {"turns": [prompt.format(**x)]})
     elif data_name == "aime25":
-        dataset = load_dataset("MathArena/aime_2025", split="train")
+        # dataset = load_dataset("MathArena/aime_2025", split="train")
+        dataset = load_dataset("parquet", data_files={"train": "/home/l00937960/dataset/aime_2025/train-00000-of-00001.parquet"}, split="train")
         prompt = (
             "{problem}\nPlease reason step by step, and put your final answer "
             "within \\boxed{{}}."
         )
         dataset = dataset.map(lambda x: {"turns": [prompt.format(**x)]})
     elif data_name == "alpaca":
-        dataset = load_dataset("tatsu-lab/alpaca", split="train")
+        # dataset = load_dataset("tatsu-lab/alpaca", split="train")
+        dataset = load_dataset("parquet", data_files={"train": "/home/l00937960/dataset/alpaca/train-00000-of-00001-a09b74b3ef9c3b56.parquet"}, split="train")
         dataset = dataset.map(
             lambda x: {
                 "formatted_input": (
@@ -38,20 +41,23 @@ def load_and_process_dataset(data_name: str):
         )
         dataset = dataset.map(lambda x: {"turns": [x["formatted_input"]]})
     elif data_name == "mt-bench":
-        dataset = load_dataset("HuggingFaceH4/mt_bench_prompts", split="train")
+        # dataset = load_dataset("HuggingFaceH4/mt_bench_prompts", split="train")
+        dataset = load_dataset("parquet", data_files={"train": "/home/l00937960/dataset/mt_bench_prompts/train-00000-of-00001-67c6c9fef07685a3.parquet"}, split="train")
         dataset = dataset.map(lambda x: {"turns": x["prompt"]})
     elif data_name == "humaneval":
-        dataset = load_dataset("openai/openai_humaneval", split="test")
+        # dataset = load_dataset("openai/openai_humaneval", split="test")
+        dataset = load_dataset("parquet", data_files={"test": "/home/l00937960/dataset/humaneval/test-00000-of-00001.parquet"}, split="test")
         prompt = (
             "Write a solution to the following problem and make sure that it "
             "passes the tests:\n```python\n{prompt}\n```"
         )
         dataset = dataset.map(lambda x: {"turns": [prompt.format(**x)]})
     elif data_name == "mbpp":
-        dataset = load_dataset(
-            "google-research-datasets/mbpp", "sanitized", split="test"
-        )
-        dataset = dataset.map(lambda x: {"turns": [x["prompt"]]})
+        # dataset = load_dataset(
+        #     "google-research-datasets/mbpp", "sanitized", split="test"
+        # )
+        dataset = load_dataset("json", data_files={"test": "/home/l00937960/dataset/mbpp/mbpp.jsonl"}, split="test")
+        dataset = dataset.map(lambda x: {"turns": [x["text"]]})
     elif data_name == "livecodebench":
         local_arrow = os.environ.get("DARTREE_LCB_ARROW", "")
         if local_arrow and os.path.isfile(local_arrow):
@@ -97,6 +103,17 @@ def load_and_process_dataset(data_name: str):
             remove_columns=dataset.column_names,
             features=features,
         )
+    elif data_name == "sharegpt":
+        dataset = load_dataset("parquet", 
+                               data_files={
+                                   "train": [
+                                        "/home/l00937960/dataset/sharegpt/train-00000-of-00004.parquet,"
+                                        "/home/l00937960/dataset/sharegpt/train-00001-of-00004.parquet",
+                                        "/home/l00937960/dataset/sharegpt/train-00002-of-00004.parquet",
+                                        "/home/l00937960/dataset/sharegpt/train-00003-of-00004.parquet",
+                                    ]}, 
+                                split="train")
+        dataset = dataset.map(lambda x: {"turns": x["conversation"]["value"][0]})
     else:
         raise ValueError(f"unsupported dataset: {data_name}")
     return dataset

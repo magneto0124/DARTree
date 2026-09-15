@@ -7,6 +7,8 @@ __pycache__/
 *.so
 .pylibs
 
+DART
+
 .venv/
 venv/
 .env
@@ -43,6 +45,7 @@ wandb/
 *.bin
 *.safetensors
 *.onnx
+*.trie
 
 .DS_Store
 .idea/
