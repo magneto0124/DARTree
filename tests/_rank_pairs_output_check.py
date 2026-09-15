@@ -79,10 +79,14 @@ summary = ns["rank_pair_summary"]
 save = ns["save_rank_pairs"]
 
 pairs = [
-    {"out_pos": 10, "token": 123, "draft_rank": 1, "ngram_rank": 3},
-    {"out_pos": 11, "token": 456, "draft_rank": 2, "ngram_rank": 2},
-    {"out_pos": 12, "token": 789, "draft_rank": 3, "ngram_rank": 1},
-    {"out_pos": 13, "token": 111, "draft_rank": 4, "ngram_rank": 4},
+    {"out_pos": 10, "token": 123, "draft_rank": 1, "ngram_rank": 3,
+     "draft_prob": 0.5, "ngram_prob": 0.2, "ngram_order": 3},
+    {"out_pos": 11, "token": 456, "draft_rank": 2, "ngram_rank": 2,
+     "draft_prob": 0.25, "ngram_prob": 0.0, "ngram_order": 0},
+    {"out_pos": 12, "token": 789, "draft_rank": 3, "ngram_rank": 1,
+     "draft_prob": 0.125, "ngram_prob": 0.8, "ngram_order": 2},
+    {"out_pos": 13, "token": 111, "draft_rank": 4, "ngram_rank": 4,
+     "draft_prob": 0.0625, "ngram_prob": 0.1, "ngram_order": 3},
 ]
 s = summary(pairs)
 print("summary:", s)
@@ -110,8 +114,13 @@ with tempfile.TemporaryDirectory() as tmp:
     assert not png_path.exists(), "PNG must be skipped when matplotlib is absent"
     with csv_path.open(encoding="utf-8", newline="") as f:
         rows = list(csv.reader(f))
-    assert rows[0] == ["out_pos", "token", "token_text", "draft_rank", "ngram_rank"]
-    assert rows[1] == ["10", "123", "", "1", "3"]
+    assert rows[0] == [
+        "out_pos", "token", "token_text", "draft_rank", "ngram_rank",
+        "draft_prob", "ngram_prob", "ngram_order",
+    ]
+    assert rows[1] == ["10", "123", "", "1", "3", "0.5", "0.2", "3"]
+    assert rows[2] == ["11", "456", "", "2", "2", "0.25", "0", "0"]
+    assert rows[3] == ["12", "789", "", "3", "1", "0.125", "0.8", "2"]
     assert len(rows) == 5
 
 print("\nALL RANK-PAIRS OUTPUT CHECKS PASSED")

@@ -321,12 +321,20 @@ def _collect_rank_pairs(
         ngram_rank = 1 + sum(
             1 for v in ngram_probs if v > ngram_probs[cand_pos]
         )
+        matched_len = 0
+        ngram_matched_row = rec.get("ngram_matched")
+        if ngram_matched_row is not None:
+            matched_len = int(ngram_matched_row[row][cand_pos])
         sink.append(
             {
                 "out_pos": int(start) + chain_index,
                 "token": token_id,
                 "draft_rank": int(draft_rank),
                 "ngram_rank": int(ngram_rank),
+                "draft_prob": float(np.exp(draft_logprobs[cand_pos])),
+                "ngram_prob": float(ngram_probs[cand_pos]),
+                # ngram match order: 0 = no match, 2 = bigram, 3 = trigram
+                "ngram_order": int(matched_len + 1) if matched_len > 0 else 0,
             }
         )
 
@@ -746,14 +754,20 @@ def build_dartree_supertree(
             )
             cand_ids = top_ids.cpu().tolist()
             ngram_rows = []
+            matched_rows: list[list[int]] = []
             for ctx, cands in zip(ngram_ctx, cand_ids):
-                probs, _matched = ngram_model.get_probability(ctx, list(cands))
+                probs, matched = ngram_model.get_probability(ctx, list(cands))
                 ngram_rows.append([float(p) for p in probs])
+                if record_rank_pairs:
+                    # matched length per candidate: 2 = trigram context hit,
+                    # 1 = bigram backoff, 0 = no match (probability 0)
+                    matched_rows.append([int(m) for m in matched])
             p_ng = torch.tensor(ngram_rows, dtype=top_scores.dtype, device=top_scores.device,)
             s_ng = torch.log(p_ng + ngram_eps)
             if record_rank_pairs:
                 rank_levels[-1]["ngram_probs"] = p_ng.detach().cpu().tolist()
                 rank_levels[-1]["contexts"] = ngram_ctx
+                rank_levels[-1]["ngram_matched"] = matched_rows
             top_scores = w_level * (w_logit * top_scores + ngram_weight * s_ng)
 
         t_select = detail_start(detail_times, device)
@@ -1701,16 +1715,26 @@ def save_rank_pairs(
     png_path: Path,
     tokenizer: Any | None = None,
 ) -> None:
-    """Write (draft top-k rank, ngram top-k rank) of every accepted
-    draft-chain token to a CSV and a first-quadrant scatter PNG with the
-    y = x diagonal. matplotlib is optional: without it only the CSV is
+    """Write (draft top-k rank, ngram top-k rank), the accepted token's draft
+    and ngram probabilities, and the ngram match order (0 = no match,
+    2 = bigram, 3 = trigram) to a CSV and a first-quadrant scatter PNG with
+    the y = x diagonal. matplotlib is optional: without it only the CSV is
     written (ranks are 1-based, 1 = best)."""
     import csv
 
     with csv_path.open("w", newline="", encoding="utf-8") as file:
         writer = csv.writer(file)
         writer.writerow(
-            ["out_pos", "token", "token_text", "draft_rank", "ngram_rank"]
+            [
+                "out_pos",
+                "token",
+                "token_text",
+                "draft_rank",
+                "ngram_rank",
+                "draft_prob",
+                "ngram_prob",
+                "ngram_order",
+            ]
         )
         for p in pairs:
             token_id = int(p["token"])
@@ -1726,6 +1750,9 @@ def save_rank_pairs(
                     text,
                     int(p["draft_rank"]),
                     int(p["ngram_rank"]),
+                    f"{float(p.get('draft_prob', 0.0)):.6g}",
+                    f"{float(p.get('ngram_prob', 0.0)):.6g}",
+                    int(p.get("ngram_order", 0)),
                 ]
             )
     print(
