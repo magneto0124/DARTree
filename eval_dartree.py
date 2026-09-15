@@ -339,6 +339,119 @@ def _collect_rank_pairs(
         )
 
 
+def _collect_rejected_proposals(
+    *,
+    next_token: int,
+    accepted_indices: list[int],
+    node_depths: torch.Tensor | list[int],
+    verify_input_ids: torch.Tensor,
+    tree_stats: dict[str, Any],
+    start: int,
+    sink: list[dict[str, Any]],
+) -> None:
+    """Record, for the round's rejected fallback token, whether it was ever
+    PROPOSED for the rejecting parent -- i.e. appeared in that parent's
+    top-k candidate row -- and which pruning step removed it before
+    verification.
+
+    ``next_token`` is the target's own prediction at the slot of the last
+    accepted node (``accepted_indices[-1]``); by construction it is not
+    among that node's children in the final tree.  Outcomes:
+      - ``not_proposed``: not in the parent's top-k candidate row at all;
+      - ``level_pruned``: proposed, but the per-level path-score selection
+        did not pick it;
+      - ``final_pruned``: proposed and selected into the pre-prune tree,
+        then dropped by the whole-tree top-B prune (selected-and-kept is
+        impossible: it would then be a child of the parent in the final
+        tree and the walk would have accepted it);
+      - ``not_expanded``: the parent sits at the tree's maximum depth, so
+        no candidates were ever proposed for it.
+    """
+    rank_levels_by_depth = {
+        int(rec["child_depth"]): rec
+        for rec in (tree_stats.get("rank_pairs_detail") or [])
+    }
+    kept_old = tree_stats.get("prune_kept_old")
+    if len(accepted_indices) < 1:
+        return
+    parent_new = int(accepted_indices[-1])
+    if kept_old is not None and parent_new > 0:
+        # new node i <-> old node kept_old[i - 1]; the root (new 0) maps
+        # to itself (old_to_new = {0: 0} in the builder)
+        parent_old = int(kept_old[parent_new - 1])
+    else:
+        parent_old = parent_new
+    parent_token = int(verify_input_ids[0, parent_new])
+    depth = int(node_depths[parent_new - 1]) if parent_new > 0 else 0
+    child_depth = depth + 1
+    base = {
+        # the fallback token lands at output position start + accepted_len
+        "out_pos": int(start) + len(accepted_indices),
+        "next_token": int(next_token),
+        "parent_node": parent_new,
+        "parent_token": parent_token,
+    }
+    rec = rank_levels_by_depth.get(child_depth)
+    if rec is None:
+        sink.append({**base, "outcome": "not_expanded"})
+        return
+    try:
+        row = rec["parent_ids"].index(parent_old)
+    except ValueError:
+        sink.append({**base, "outcome": "not_proposed"})
+        return
+    cands = rec["cands"][row]
+    try:
+        cand_pos = cands.index(int(next_token))
+    except ValueError:
+        sink.append({**base, "outcome": "not_proposed"})
+        return
+    draft_logprobs = rec["draft_logprobs"][row]
+    ngram_row = rec.get("ngram_probs")
+    if ngram_row is not None:
+        ngram_probs = ngram_row[row]
+        ngram_matched_row = rec.get("ngram_matched")
+        matched_len = (
+            int(ngram_matched_row[row][cand_pos])
+            if ngram_matched_row is not None
+            else 0
+        )
+        ngram_order = int(matched_len + 1) if matched_len > 0 else 0
+    else:
+        ngram_probs = None
+        ngram_order = 0
+    draft_rank = 1 + sum(
+        1 for v in draft_logprobs if v > draft_logprobs[cand_pos]
+    )
+    ngram_rank = (
+        1 + sum(1 for v in ngram_probs if v > ngram_probs[cand_pos])
+        if ngram_probs is not None
+        else 0
+    )
+    selected_pairs = rec.get("selected_pairs")
+    if selected_pairs is not None and [row, cand_pos] in selected_pairs:
+        outcome = "final_pruned"
+    else:
+        outcome = "level_pruned"
+    sink.append(
+        {
+            **base,
+            "outcome": outcome,
+            "cand_pos": int(cand_pos),
+            "child_depth": int(child_depth),
+            "draft_rank": int(draft_rank),
+            "draft_prob": float(np.exp(draft_logprobs[cand_pos])),
+            "ngram_rank": int(ngram_rank),
+            "ngram_prob": (
+                float(ngram_probs[cand_pos])
+                if ngram_probs is not None
+                else 0.0
+            ),
+            "ngram_order": int(ngram_order),
+        }
+    )
+
+
 def _compact_appended_window(
     cache_tensor: torch.Tensor,
     past_length: int,
@@ -731,6 +844,9 @@ def build_dartree_supertree(
                     "draft_logprobs": top_scores.detach()
                     .cpu()
                     .tolist(),
+                    # old node id of this level's first new node; the j-th
+                    # selected pair below gets old id base + 1 + j
+                    "base_node_id": int(node_count),
                 }
             )
 
@@ -813,6 +929,17 @@ def build_dartree_supertree(
         selected_rank = selected_flat.remainder(
             scored_candidate_count
         )
+        if record_rank_pairs:
+            # which (parent row, candidate position) pairs this level selected
+            # (in descending path-score order, matching the write order that
+            # assigns old node ids base + 1 + j)
+            rank_levels[-1]["selected_pairs"] = [
+                [int(p), int(r)]
+                for p, r in zip(
+                    selected_parent_pos.tolist(),
+                    selected_rank.tolist(),
+                )
+            ]
         selected_parent_indices = parent_indices.index_select(
             0, selected_parent_pos
         )
@@ -1163,6 +1290,9 @@ def dartree_generate(
     # (draft top-k rank, ngram top-k rank) of every accepted draft-chain
     # token, when record_rank_pairs is enabled (needs the ngram model).
     rank_pairs: list[dict[str, Any]] = []
+    # per round: the rejected fallback token and whether the rejecting
+    # parent ever proposed it (and which pruning removed it)
+    rejected_proposals: list[dict[str, Any]] = []
     tree_buffers: dict[str, torch.Tensor] = {}
     # Target entropy (nats) at each accepted draft-chain node, DARTree path.
     entropy_target: list[float] = []
@@ -1447,6 +1577,15 @@ def dartree_generate(
                 start=start,
                 sink=rank_pairs,
             )
+            _collect_rejected_proposals(
+                next_token=int(next_token),
+                accepted_indices=accepted_indices,
+                node_depths=node_depths,
+                verify_input_ids=verify_input_ids,
+                tree_stats=tree_stats,
+                start=start,
+                sink=rejected_proposals,
+            )
         if record_entropy and accepted_len > 1:
             # Accepted draft-chain nodes are accepted_indices[1:].  Node i is a
             # draft token the target accepted using its logit slot parents[i]
@@ -1607,7 +1746,8 @@ def dartree_generate(
     if record_rank_pairs:
         print(
             "[rank-pairs] collected "
-            f"{len(rank_pairs)} (draft, ngram) rank pairs"
+            f"{len(rank_pairs)} (draft, ngram) rank pairs, "
+            f"{len(rejected_proposals)} rejected-token proposal lookups"
         )
     return SimpleNamespace(
         output_ids=output_ids.detach().cpu(),
@@ -1637,6 +1777,7 @@ def dartree_generate(
         entropy=entropy_summary,
         entropy_target=entropy_target,
         rank_pairs=rank_pairs,
+        rejected_proposals=rejected_proposals,
     )
 
 
@@ -1815,6 +1956,85 @@ def save_rank_pairs(
     fig.savefig(png_path, dpi=150)
     plt.close(fig)
     print(f"[rank-pairs] saved scatter: {png_path}")
+
+
+def rejected_proposal_summary(
+    entries: list[dict[str, Any]],
+) -> dict[str, float]:
+    """Count rejected-token outcomes and the fraction where the rejecting
+    parent had actually proposed the token."""
+    n = len(entries)
+    counts: dict[str, float] = {
+        "not_proposed": 0.0,
+        "level_pruned": 0.0,
+        "final_pruned": 0.0,
+        "not_expanded": 0.0,
+    }
+    for e in entries:
+        outcome = str(e.get("outcome", "not_proposed"))
+        counts[outcome] = counts.get(outcome, 0.0) + 1.0
+    proposed = counts["level_pruned"] + counts["final_pruned"]
+    return {
+        "total": float(n),
+        **counts,
+        "frac_proposed": (proposed / float(n)) if n else 0.0,
+    }
+
+
+def save_rejected_proposals(
+    entries: list[dict[str, Any]],
+    csv_path: Path,
+    tokenizer: Any = None,
+) -> None:
+    """Write one row per round: the rejected fallback token, whether the
+    rejecting parent ever proposed it (outcome), and the token's draft /
+    ngram statistics at the proposed position (empty when not proposed)."""
+    with csv_path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.writer(file)
+        writer.writerow(
+            [
+                "out_pos",
+                "next_token",
+                "token_text",
+                "parent_node",
+                "parent_token",
+                "parent_token_text",
+                "outcome",
+                "draft_rank",
+                "draft_prob",
+                "ngram_rank",
+                "ngram_prob",
+                "ngram_order",
+            ]
+        )
+        for e in entries:
+            next_id = int(e["next_token"])
+            parent_id = int(e["parent_token"])
+            writer.writerow(
+                [
+                    int(e["out_pos"]),
+                    next_id,
+                    (
+                        tokenizer.decode([next_id])
+                        if tokenizer is not None
+                        else ""
+                    ),
+                    int(e["parent_node"]),
+                    parent_id,
+                    (
+                        tokenizer.decode([parent_id])
+                        if tokenizer is not None
+                        else ""
+                    ),
+                    str(e.get("outcome", "not_proposed")),
+                    int(e.get("draft_rank", 0)),
+                    f"{float(e.get('draft_prob', 0.0)):.6g}",
+                    int(e.get("ngram_rank", 0)),
+                    f"{float(e.get('ngram_prob', 0.0)):.6g}",
+                    int(e.get("ngram_order", 0)),
+                ]
+            )
+    print(f"[rejected-proposals] saved CSV: {csv_path}")
 
 
 def row_from_response(
@@ -2187,6 +2407,7 @@ def main() -> None:
 
     rows: list[dict[str, Any]] = []
     all_rank_pairs: list[dict[str, Any]] = []
+    all_rejected_proposals: list[dict[str, Any]] = []
     for idx, instance in enumerate(
         tqdm(dataset, desc="dartree-eval")
     ):
@@ -2280,6 +2501,9 @@ def main() -> None:
                 all_rank_pairs.extend(
                     getattr(tree_response, "rank_pairs", [])
                 )
+                all_rejected_proposals.extend(
+                    getattr(tree_response, "rejected_proposals", [])
+                )
             row["dartree"] = row_from_response(
                 tree_response, tokenizer
             )
@@ -2343,6 +2567,15 @@ def main() -> None:
         )
         summary["rank_pairs"] = rank_pair_summary(
             all_rank_pairs
+        )
+    if args.record_rank_pairs and all_rejected_proposals:
+        save_rejected_proposals(
+            all_rejected_proposals,
+            Path(args.output).with_suffix(".rejected_proposals.csv"),
+            tokenizer,
+        )
+        summary["rejected_proposal"] = rejected_proposal_summary(
+            all_rejected_proposals
         )
 
     with out_path.open("w", encoding="utf-8") as file:
