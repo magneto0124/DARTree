@@ -44,6 +44,15 @@ def main() -> None:
             "draft-chain position (DARTree path and Domino chain baseline)."
         ),
     )
+    parser.add_argument(
+        "--record-rank-pairs", action="store_true",
+        help=(
+            "Record the (draft top-k rank, ngram top-k rank) of every accepted "
+            "draft-chain token and write a CSV + first-quadrant scatter PNG "
+            "(with the y=x diagonal) next to --output. "
+            "Requires --ngram-weight > 0."
+        ),
+    )
     args = parser.parse_args()
 
     from eval_dartree import main as evaluate
@@ -91,6 +100,8 @@ def main() -> None:
         engine_args.append("--record-round-trace")
     if args.record_entropy:
         engine_args.append("--record-entropy")
+    if args.record_rank_pairs:
+        engine_args.append("--record-rank-pairs")
 
     sys.argv = engine_args
     evaluate()
