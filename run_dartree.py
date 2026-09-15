@@ -14,6 +14,7 @@ SAMPLE_COUNTS = {
     "livecodebench": 128,
     "mt-bench": 80,
     "alpaca": 128,
+    "sharegpt": 128,
 }
 
 
