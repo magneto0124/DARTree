@@ -1747,7 +1747,7 @@ def save_rank_pairs(
     limit = max(max(xs), max(ys), 1)
     # start the axes below rank 1 so points clustered at (1, 1) are not
     # glued to the edges; the y = x diagonal spans the full plot
-    lo = -1.0
+    lo = -5.0
     fig, ax = plt.subplots(figsize=(6, 6))
     ax.scatter(xs, ys, s=12, alpha=0.6, edgecolors="none")
     ax.plot(
