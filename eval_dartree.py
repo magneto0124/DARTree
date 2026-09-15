@@ -2281,6 +2281,8 @@ def main() -> None:
             - summary["domino"]["mean_acceptance_length"]
         )
 
+    out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     if args.record_rank_pairs and all_rank_pairs:
         out_path = Path(args.output)
         save_rank_pairs(
@@ -2293,8 +2295,6 @@ def main() -> None:
             all_rank_pairs
         )
 
-    out_path = Path(args.output)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", encoding="utf-8") as file:
         json.dump(
             {"summary": summary, "rows": rows},
