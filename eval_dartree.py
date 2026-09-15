@@ -263,6 +263,74 @@ def follow_verified_tree(
     return accepted_indices, next_token
 
 
+def _collect_rank_pairs(
+    *,
+    accepted_indices: list[int],
+    parents: list[int],
+    node_depths: torch.Tensor | list[int],
+    verify_input_ids: torch.Tensor,
+    tree_stats: dict[str, Any],
+    start: int,
+    sink: list[dict[str, Any]],
+) -> None:
+    """Append the (draft top-k rank, ngram top-k rank) of every accepted
+    draft-chain token to ``sink``.
+
+    The accepted token is always among the parent's top-k candidates (the
+    tree is expanded from those), so both ranks are well defined in
+    ``[1, k]`` (1 = best). Ranks count strictly-better candidates, so ties
+    share a rank; rows whose recorded table lacks ngram data (ngram scoring
+    disabled) or whose parent/token cannot be mapped back are skipped.
+    """
+    rank_levels_by_depth = {
+        int(rec["child_depth"]): rec
+        for rec in (tree_stats.get("rank_pairs_detail") or [])
+    }
+    kept_old = tree_stats.get("prune_kept_old")
+    for chain_index in range(1, len(accepted_indices)):
+        node = int(accepted_indices[chain_index])
+        parent_new = int(parents[node])
+        if kept_old is not None and parent_new > 0:
+            # new node i <-> old node kept_old[i - 1]; the root (new 0) maps
+            # to itself (old_to_new = {0: 0} in the builder)
+            parent_old = int(kept_old[parent_new - 1])
+        else:
+            parent_old = parent_new
+        depth = int(node_depths[node - 1])
+        rec = rank_levels_by_depth.get(depth)
+        if rec is None:
+            continue
+        try:
+            row = rec["parent_ids"].index(parent_old)
+        except ValueError:
+            continue
+        cands = rec["cands"][row]
+        draft_logprobs = rec["draft_logprobs"][row]
+        ngram_row = rec.get("ngram_probs")
+        if ngram_row is None:
+            continue
+        ngram_probs = ngram_row[row]
+        token_id = int(verify_input_ids[0, node])
+        try:
+            cand_pos = cands.index(token_id)
+        except ValueError:
+            continue
+        draft_rank = 1 + sum(
+            1 for v in draft_logprobs if v > draft_logprobs[cand_pos]
+        )
+        ngram_rank = 1 + sum(
+            1 for v in ngram_probs if v > ngram_probs[cand_pos]
+        )
+        sink.append(
+            {
+                "out_pos": int(start) + chain_index,
+                "token": token_id,
+                "draft_rank": int(draft_rank),
+                "ngram_rank": int(ngram_rank),
+            }
+        )
+
+
 def _compact_appended_window(
     cache_tensor: torch.Tensor,
     past_length: int,
@@ -398,6 +466,7 @@ def build_dartree_supertree(
     ngram_model: Any | None = None,
     ngram_weight: float = 0.0,
     ngram_eps: float = 1e-10,
+    record_rank_pairs: bool = False,
     detail_times: dict[str, float] | None = None,
 ) -> tuple[
     torch.Tensor,
@@ -557,6 +626,11 @@ def build_dartree_supertree(
     node_count = 0
     frontier_t = torch.tensor([0], dtype=torch.long, device=device)
     frontier_len = 1
+    # Per-level candidate tables for the (draft rank, ngram rank) diagnostic:
+    # keyed by child_depth, one entry per level, rows aligned to the frontier
+    # (parent) order. Attached to ``stats`` only when record_rank_pairs.
+    rank_levels: list[dict[str, Any]] = []
+    kept_old_for_ranks: list[int] | None = None
     for child_depth in range(1, depth_limit + 1):
         if frontier_len <= 0 or node_count >= int(supertree_budget):
             break
@@ -631,6 +705,21 @@ def build_dartree_supertree(
             device,
         )
 
+        if record_rank_pairs:
+            # Snapshot the PURE draft candidate table (logits / log-probs)
+            # BEFORE the ngram block rewrites top_scores at the bottom of
+            # this level; rows are aligned to ``parent_indices``.
+            rank_levels.append(
+                {
+                    "child_depth": int(child_depth),
+                    "parent_ids": parent_indices.tolist(),
+                    "cands": top_ids.cpu().tolist(),
+                    "draft_logprobs": top_scores.detach()
+                    .cpu()
+                    .tolist(),
+                }
+            )
+
         # DART-style continuity-aware scoring (Algorithm 1 / App. D):
         #   score += w_level * (w_logit * s_logit + w_ngram * s_ngram)
         # with w_level = (level+1)**-0.7, w_logit = 0.9**level and
@@ -662,6 +751,9 @@ def build_dartree_supertree(
                 ngram_rows.append([float(p) for p in probs])
             p_ng = torch.tensor(ngram_rows, dtype=top_scores.dtype, device=top_scores.device,)
             s_ng = torch.log(p_ng + ngram_eps)
+            if record_rank_pairs:
+                rank_levels[-1]["ngram_probs"] = p_ng.detach().cpu().tolist()
+                rank_levels[-1]["contexts"] = ngram_ctx
             top_scores = w_level * (w_logit * top_scores + ngram_weight * s_ng)
 
         t_select = detail_start(detail_times, device)
@@ -832,6 +924,10 @@ def build_dartree_supertree(
                 prune_scores,
                 int(budget),
             )
+        if record_rank_pairs:
+            # new node i <-> old node kept_old_indices_list[i - 1]; used to
+            # map accepted (new-id) nodes back to the recorded per-level tables
+            kept_old_for_ranks = kept_old_indices_list
         if len(kept_old_indices_list) != int(budget):
             raise RuntimeError(
                 "Top-B pruning selected "
@@ -923,6 +1019,10 @@ def build_dartree_supertree(
             for index, width in enumerate(final_layer_widths)
         }
     )
+    if record_rank_pairs:
+        stats["rank_pairs_detail"] = rank_levels
+        if kept_old_for_ranks is not None:
+            stats["prune_kept_old"] = kept_old_for_ranks
     return (
         node_token_tensor,
         node_depth_tensor,
@@ -954,6 +1054,7 @@ def dartree_generate(
     ngram_weight: float = 0.0,
     record_round_trace: bool = False,
     record_entropy: bool = False,
+    record_rank_pairs: bool = False,
     verify_buffer_nodes: int = 0,
 ) -> SimpleNamespace:
     if input_ids.ndim != 2 or input_ids.shape[0] != 1:
@@ -1025,6 +1126,9 @@ def dartree_generate(
     tree_stat_totals: dict[str, float] = defaultdict(float)
     tree_heights: list[int] = []
     round_trace: list[dict[str, Any]] = []
+    # (draft top-k rank, ngram top-k rank) of every accepted draft-chain
+    # token, when record_rank_pairs is enabled (needs the ngram model).
+    rank_pairs: list[dict[str, Any]] = []
     tree_buffers: dict[str, torch.Tensor] = {}
     # Target entropy (nats) at each accepted draft-chain node, DARTree path.
     entropy_target: list[float] = []
@@ -1236,6 +1340,7 @@ def dartree_generate(
             pruned=(variant == "pruned"),
             ngram_model=ngram_model,
             ngram_weight=ngram_weight,
+            record_rank_pairs=record_rank_pairs,
             detail_times=detail_times,
         )
         tree_build_elapsed = cuda_time(device) - tree_start
@@ -1298,6 +1403,16 @@ def dartree_generate(
             device,
         )
         accepted_len = int(len(accepted_indices))
+        if record_rank_pairs:
+            _collect_rank_pairs(
+                accepted_indices=accepted_indices,
+                parents=parents,
+                node_depths=node_depths,
+                verify_input_ids=verify_input_ids,
+                tree_stats=tree_stats,
+                start=start,
+                sink=rank_pairs,
+            )
         if record_entropy and accepted_len > 1:
             # Accepted draft-chain nodes are accepted_indices[1:].  Node i is a
             # draft token the target accepted using its logit slot parents[i]
@@ -1455,6 +1570,11 @@ def dartree_generate(
             f"n={len(entropy_target)} "
             f"mean target={sum(entropy_target)/len(entropy_target):.4f}"
         )
+    if record_rank_pairs:
+        print(
+            "[rank-pairs] collected "
+            f"{len(rank_pairs)} (draft, ngram) rank pairs"
+        )
     return SimpleNamespace(
         output_ids=output_ids.detach().cpu(),
         num_input_tokens=int(num_input_tokens),
@@ -1482,6 +1602,7 @@ def dartree_generate(
         round_trace=round_trace,
         entropy=entropy_summary,
         entropy_target=entropy_target,
+        rank_pairs=rank_pairs,
     )
 
 
@@ -1543,6 +1664,107 @@ def summarize_choice(rows: list[dict[str, Any]], key: str) -> dict[str, Any]:
             for name in sorted(tree_stat_totals)
         },
     }
+
+
+def rank_pair_summary(pairs: list[dict[str, Any]]) -> dict[str, float]:
+    """Summary stats over (draft_rank, ngram_rank) pairs of accepted tokens."""
+    n = len(pairs)
+    if n == 0:
+        return {"n": 0.0}
+    xs = np.array(
+        [int(p["draft_rank"]) for p in pairs], dtype=np.float64
+    )
+    ys = np.array(
+        [int(p["ngram_rank"]) for p in pairs], dtype=np.float64
+    )
+    corr = 0.0
+    if n > 1 and len(set(xs)) > 1 and len(set(ys)) > 1:
+        # corrcoef is NaN when either series is constant (division by zero)
+        corr = float(np.corrcoef(xs, ys)[0, 1])
+    return {
+        "n": float(n),
+        "mean_draft_rank": float(xs.mean()),
+        "mean_ngram_rank": float(ys.mean()),
+        "pearson_rank_corr": corr,
+        # below the y=x diagonal: the ngram ranked the accepted token
+        # strictly better (smaller rank) than the draft model did
+        "frac_ngram_better_than_draft": float(
+            np.mean(ys < xs)
+        ),
+        "frac_equal_rank": float(np.mean(ys == xs)),
+    }
+
+
+def save_rank_pairs(
+    pairs: list[dict[str, Any]],
+    csv_path: Path,
+    png_path: Path,
+    tokenizer: Any | None = None,
+) -> None:
+    """Write (draft top-k rank, ngram top-k rank) of every accepted
+    draft-chain token to a CSV and a first-quadrant scatter PNG with the
+    y = x diagonal. matplotlib is optional: without it only the CSV is
+    written (ranks are 1-based, 1 = best)."""
+    import csv
+
+    with csv_path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.writer(file)
+        writer.writerow(
+            ["out_pos", "token", "token_text", "draft_rank", "ngram_rank"]
+        )
+        for p in pairs:
+            token_id = int(p["token"])
+            text = (
+                tokenizer.decode([token_id])
+                if tokenizer is not None
+                else ""
+            )
+            writer.writerow(
+                [
+                    int(p["out_pos"]),
+                    token_id,
+                    text,
+                    int(p["draft_rank"]),
+                    int(p["ngram_rank"]),
+                ]
+            )
+    print(
+        f"[rank-pairs] saved CSV: {csv_path} (n={len(pairs)})"
+    )
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:  # pragma: no cover
+        print(
+            "[rank-pairs] matplotlib unavailable "
+            f"({exc}); CSV written, PNG skipped"
+        )
+        return
+    xs = [int(p["draft_rank"]) for p in pairs]
+    ys = [int(p["ngram_rank"]) for p in pairs]
+    limit = max(max(xs), max(ys), 1)
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.scatter(xs, ys, s=12, alpha=0.6, edgecolors="none")
+    ax.plot(
+        [1, limit],
+        [1, limit],
+        "r--",
+        linewidth=1,
+        label="y = x",
+    )
+    ax.set_xlabel("draft top-k rank of accepted token")
+    ax.set_ylabel("ngram top-k rank of accepted token")
+    ax.set_title(f"accepted-token ranks (n={len(pairs)})")
+    ax.set_xlim(1, limit)
+    ax.set_ylim(1, limit)
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(png_path, dpi=150)
+    plt.close(fig)
+    print(f"[rank-pairs] saved scatter: {png_path}")
 
 
 def row_from_response(
@@ -1720,6 +1942,16 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Print the TARGET model word-distribution entropy at each accepted "
             "draft-chain position (DARTree path and Domino chain baseline)."
+        ),
+    )
+    parser.add_argument(
+        "--record-rank-pairs", action="store_true",
+        help=(
+            "For every accepted draft-chain token, record its 1-based rank in "
+            "the draft model's top-k candidate distribution and in the n-gram "
+            "model's ranking of the same candidates, then write a CSV and a "
+            "first-quadrant scatter PNG (with the y=x diagonal) next to "
+            "--output. Requires --ngram-weight > 0."
         ),
     )
     parser.add_argument(
@@ -1904,6 +2136,7 @@ def main() -> None:
         )
 
     rows: list[dict[str, Any]] = []
+    all_rank_pairs: list[dict[str, Any]] = []
     for idx, instance in enumerate(
         tqdm(dataset, desc="dartree-eval")
     ):
@@ -1988,10 +2221,15 @@ def main() -> None:
                     args.record_round_trace
                 ),
                 record_entropy=args.record_entropy,
+                record_rank_pairs=args.record_rank_pairs,
                 verify_buffer_nodes=(
                     1 + int(args.tree_budget)
                 ),
             )
+            if args.record_rank_pairs:
+                all_rank_pairs.extend(
+                    getattr(tree_response, "rank_pairs", [])
+                )
             row["dartree"] = row_from_response(
                 tree_response, tokenizer
             )
@@ -2041,6 +2279,18 @@ def main() -> None:
         summary["dartree_accept_delta_vs_domino"] = (
             summary["dartree"]["mean_acceptance_length"]
             - summary["domino"]["mean_acceptance_length"]
+        )
+
+    if args.record_rank_pairs and all_rank_pairs:
+        out_path = Path(args.output)
+        save_rank_pairs(
+            all_rank_pairs,
+            out_path.with_suffix(".rank_pairs.csv"),
+            out_path.with_suffix(".rank_pairs.png"),
+            tokenizer,
+        )
+        summary["rank_pairs"] = rank_pair_summary(
+            all_rank_pairs
         )
 
     out_path = Path(args.output)
