@@ -35,6 +35,14 @@ def main() -> None:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--ngram-model", default=None)
     parser.add_argument("--ngram-weight", type=float, default=0.0)
+    parser.add_argument(
+        "--renorm-ngram", action="store_true",
+        help=(
+            "Renormalize each parent's ngram candidate probabilities over "
+            "its candidate set before fusing with the draft term (see "
+            "eval_dartree.py --renorm-ngram)."
+        ),
+    )
     parser.add_argument("--output")
     parser.add_argument("--record-round-trace", action="store_true")
     parser.add_argument(
@@ -102,6 +110,8 @@ def main() -> None:
         engine_args.append("--record-entropy")
     if args.record_rank_pairs:
         engine_args.append("--record-rank-pairs")
+    if args.renorm_ngram:
+        engine_args.append("--renorm-ngram")
 
     sys.argv = engine_args
     evaluate()

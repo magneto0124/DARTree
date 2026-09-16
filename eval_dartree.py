@@ -598,6 +598,28 @@ def _ngram_contexts(
 # down-weighted relative to a full trigram match.
 ratio = [0.0, 0.2, 0.8]
 
+
+def _renormalize_ngram_rows(
+    p_ng: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Renormalize every parent's ngram candidate row over its candidate
+    set, so the rows sum to 1.
+
+    The draft term in the tree score is a conditional distribution over the
+    candidate set (log-softmax over that support), while the raw ngram
+    probabilities are normalized over the ngram model's full vocabulary --
+    mixing the two in ``w_logit * s_logit + w_ngram * s_ngram`` compares
+    different scales and injects a per-row offset (the ngram mass the
+    candidate set captures) into cross-parent comparisons.  Renormalizing
+    makes both terms conditional distributions over the same support.
+
+    All-zero rows (no ngram match anywhere) stay zero after the guard, and
+    the caller's ``+ eps`` floor still applies at log time.
+    """
+    denom = p_ng.sum(dim=-1, keepdim=True).clamp_min(eps)
+    return p_ng / denom
+
 @torch.inference_mode()
 def build_dartree_supertree(
     *,
@@ -619,6 +641,7 @@ def build_dartree_supertree(
     ngram_weight: float = 0.0,
     ngram_eps: float = 1e-10,
     record_rank_pairs: bool = False,
+    renorm_ngram: bool = False,
     detail_times: dict[str, float] | None = None,
 ) -> tuple[
     torch.Tensor,
@@ -924,6 +947,11 @@ def build_dartree_supertree(
                 dtype=p_ng.dtype,
                 device=p_ng.device,
             )
+            if renorm_ngram:
+                # renormalize over the candidate set so the ngram term fuses
+                # with the draft term as a conditional distribution over the
+                # same support (see _renormalize_ngram_rows)
+                p_ng = _renormalize_ngram_rows(p_ng, ngram_eps)
             s_ng = torch.log(p_ng + ngram_eps)
             if record_rank_pairs:
                 rank_levels[-1]["ngram_probs"] = p_ng.detach().cpu().tolist()
@@ -1241,6 +1269,7 @@ def dartree_generate(
     record_round_trace: bool = False,
     record_entropy: bool = False,
     record_rank_pairs: bool = False,
+    renorm_ngram: bool = False,
     verify_buffer_nodes: int = 0,
 ) -> SimpleNamespace:
     if input_ids.ndim != 2 or input_ids.shape[0] != 1:
@@ -1530,6 +1559,7 @@ def dartree_generate(
             ngram_model=ngram_model,
             ngram_weight=ngram_weight,
             record_rank_pairs=record_rank_pairs,
+            renorm_ngram=renorm_ngram,
             detail_times=detail_times,
         )
         tree_build_elapsed = cuda_time(device) - tree_start
@@ -2260,6 +2290,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--renorm-ngram", action="store_true",
+        help=(
+            "Renormalize each parent's ngram candidate probabilities over "
+            "its candidate set (rows sum to 1) before fusing with the draft "
+            "term, so both terms are conditional distributions over the "
+            "same support. Off by default (raw full-vocabulary ngram "
+            "probabilities). Requires --ngram-weight > 0."
+        ),
+    )
+    parser.add_argument(
         "--temperature", type=float, default=0.0
     )
     parser.add_argument("--device", default="cuda:0")
@@ -2553,6 +2593,7 @@ def main() -> None:
                 ),
                 record_entropy=args.record_entropy,
                 record_rank_pairs=args.record_rank_pairs,
+                renorm_ngram=args.renorm_ngram,
                 verify_buffer_nodes=(
                     1 + int(args.tree_budget)
                 ),
