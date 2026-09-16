@@ -1,10 +1,11 @@
-"""Standalone logic test for eval_dartree._collect_unwalked, unwalked_summary
-and save_unwalked (no torch needed).
+"""Standalone logic test for eval_dartree._collect_tree_table, tree_table_summary
+and save_tree_table (no torch needed).
 
-Covers: fixed-variant tree (walked_past siblings + unreached descendants),
-root-only acceptance, pruned-variant new<->old parent mapping, skip paths
-(missing level record / token not in the parent's candidate row), summary
-counts, and the CSV writer.
+Covers: fixed-variant tree with hit / walked_past / unreached categories,
+root-only acceptance (no hit), pruned-variant new<->old parent mapping, skip
+paths (missing level record / token not in the parent's candidate row),
+summary counts, the CSV writer (exact column order), and the matplotlib-less
+scatter fallback.
 """
 import ast
 import csv
@@ -15,7 +16,12 @@ from typing import Any
 
 SRC = open("eval_dartree.py", encoding="utf-8").read()
 tree = ast.parse(SRC)
-names = ["_collect_unwalked", "unwalked_summary", "save_unwalked"]
+names = [
+    "_collect_tree_table",
+    "tree_table_summary",
+    "save_tree_table",
+    "_save_rank_scatter",
+]
 fns = [
     next(n for n in ast.walk(tree)
          if isinstance(n, ast.FunctionDef) and n.name == name)
@@ -29,9 +35,9 @@ ns = {
     "Path": Path,
 }
 exec(compile(ast.Module(body=fns, type_ignores=[]), "<fns>", "exec"), ns)
-collect = ns["_collect_unwalked"]
-summary = ns["unwalked_summary"]
-save = ns["save_unwalked"]
+collect = ns["_collect_tree_table"]
+summary = ns["tree_table_summary"]
+save = ns["save_tree_table"]
 
 
 class VID:
@@ -68,9 +74,8 @@ def run(accepted, parents, depths, vid_tokens, stats, start=100):
 
 
 # Tree: node1<-root, node2<-root, node3<-node1, node4<-node2.
-# Accepted path [0, 1]: node2 = walked_past sibling of the chain,
-# node3 = walked_past (parent on path), node4 = unreached (parent node2
-# was never walked).
+# Accepted path [0, 1]: node1 = hit, node2 = walked_past, node3 = walked_past
+# (parent on path), node4 = unreached (parent node2 never walked).
 LEVELS = {
     1: {
         "child_depth": 1,
@@ -97,35 +102,38 @@ out = run(
     stats={"rank_pairs_detail": list(LEVELS.values())},
 )
 check(
-    "fixed tree: walked_past + unreached",
+    "fixed tree: hit + walked_past + unreached",
     out,
     [
         {
-            "out_pos": 101, "node": 2, "depth": 1,
-            "token": 12, "parent_node": 0, "parent_token": 100,
-            "category": "walked_past",
+            "output_pos": 101, "depth": 1, "parent_token": 100,
+            "category": "hit", "token": 11,
+            "draft_rank": 1, "draft_prob": math.exp(-0.1),
+            "ngram_order": 3, "ngram_rank": 1, "ngram_prob": 0.5,
+        },
+        {
+            "output_pos": 101, "depth": 1, "parent_token": 100,
+            "category": "walked_past", "token": 12,
             "draft_rank": 2, "draft_prob": math.exp(-0.5),
-            "ngram_rank": 2, "ngram_prob": 0.2, "ngram_order": 3,
+            "ngram_order": 3, "ngram_rank": 2, "ngram_prob": 0.2,
         },
         {
-            "out_pos": 102, "node": 3, "depth": 2,
-            "token": 21, "parent_node": 1, "parent_token": 11,
-            "category": "walked_past",
+            "output_pos": 102, "depth": 2, "parent_token": 11,
+            "category": "walked_past", "token": 21,
             "draft_rank": 1, "draft_prob": math.exp(-0.2),
-            "ngram_rank": 2, "ngram_prob": 0.3, "ngram_order": 3,
+            "ngram_order": 3, "ngram_rank": 2, "ngram_prob": 0.3,
         },
         {
-            "out_pos": 102, "node": 4, "depth": 2,
-            "token": 22, "parent_node": 2, "parent_token": 12,
-            "category": "unreached",
+            "output_pos": 102, "depth": 2, "parent_token": 12,
+            "category": "unreached", "token": 22,
             "draft_rank": 1, "draft_prob": math.exp(-0.3),
             # ngram row [0.1, 0.9, 0.2]: 0.9 and 0.2 are strictly better
-            "ngram_rank": 3, "ngram_prob": 0.1, "ngram_order": 2,
+            "ngram_order": 2, "ngram_rank": 3, "ngram_prob": 0.1,
         },
     ],
 )
 
-# Root-only acceptance: every final-tree node is a walked-past sibling.
+# Root-only acceptance: no hit, every node is a walked-past sibling.
 out = run(
     accepted=[0],
     parents=[-1, 0, 0],
@@ -134,27 +142,25 @@ out = run(
     stats={"rank_pairs_detail": [LEVELS[1]]},
 )
 check(
-    "root-only acceptance -> all walked_past",
+    "root-only acceptance -> all walked_past, no hit",
     out,
     [
         {
-            "out_pos": 101, "node": 1, "depth": 1,
-            "token": 11, "parent_node": 0, "parent_token": 100,
-            "category": "walked_past",
+            "output_pos": 101, "depth": 1, "parent_token": 100,
+            "category": "walked_past", "token": 11,
             "draft_rank": 1, "draft_prob": math.exp(-0.1),
-            "ngram_rank": 1, "ngram_prob": 0.5, "ngram_order": 3,
+            "ngram_order": 3, "ngram_rank": 1, "ngram_prob": 0.5,
         },
         {
-            "out_pos": 101, "node": 2, "depth": 1,
-            "token": 12, "parent_node": 0, "parent_token": 100,
-            "category": "walked_past",
+            "output_pos": 101, "depth": 1, "parent_token": 100,
+            "category": "walked_past", "token": 12,
             "draft_rank": 2, "draft_prob": math.exp(-0.5),
-            "ngram_rank": 2, "ngram_prob": 0.2, "ngram_order": 3,
+            "ngram_order": 3, "ngram_rank": 2, "ngram_prob": 0.2,
         },
     ],
 )
 
-# Pruned variant: new node 2/3 have old parents via kept_old (new 1 <-> old 3).
+# Pruned variant: new nodes 2/3 have old parent 3 via kept_old (new 1 <-> old 3).
 out = run(
     accepted=[0, 1],
     parents=[-1, 0, 1, 1],
@@ -187,23 +193,27 @@ check(
     out,
     [
         {
-            "out_pos": 102, "node": 2, "depth": 2,
-            "token": 51, "parent_node": 1, "parent_token": 31,
-            "category": "walked_past",
-            "draft_rank": 1, "draft_prob": math.exp(-0.2),
-            "ngram_rank": 1, "ngram_prob": 0.5, "ngram_order": 3,
+            "output_pos": 101, "depth": 1, "parent_token": 100,
+            "category": "hit", "token": 31,
+            "draft_rank": 1, "draft_prob": math.exp(-0.1),
+            "ngram_order": 3, "ngram_rank": 1, "ngram_prob": 0.9,
         },
         {
-            "out_pos": 102, "node": 3, "depth": 2,
-            "token": 52, "parent_node": 1, "parent_token": 31,
-            "category": "walked_past",
+            "output_pos": 102, "depth": 2, "parent_token": 31,
+            "category": "walked_past", "token": 51,
+            "draft_rank": 1, "draft_prob": math.exp(-0.2),
+            "ngram_order": 3, "ngram_rank": 1, "ngram_prob": 0.5,
+        },
+        {
+            "output_pos": 102, "depth": 2, "parent_token": 31,
+            "category": "walked_past", "token": 52,
             "draft_rank": 2, "draft_prob": math.exp(-0.8),
-            "ngram_rank": 2, "ngram_prob": 0.4, "ngram_order": 3,
+            "ngram_order": 3, "ngram_rank": 2, "ngram_prob": 0.4,
         },
     ],
 )
 
-# Skip paths: token not in the parent's candidate row; level record missing.
+# Skip paths: token not in the parent's candidate row; no level records.
 out = run(
     accepted=[0],
     parents=[-1, 0, 0],
@@ -216,11 +226,10 @@ check(
     out,
     [
         {
-            "out_pos": 101, "node": 1, "depth": 1,
-            "token": 11, "parent_node": 0, "parent_token": 100,
-            "category": "walked_past",
+            "output_pos": 101, "depth": 1, "parent_token": 100,
+            "category": "walked_past", "token": 11,
             "draft_rank": 1, "draft_prob": math.exp(-0.1),
-            "ngram_rank": 1, "ngram_prob": 0.5, "ngram_order": 3,
+            "ngram_order": 3, "ngram_rank": 1, "ngram_prob": 0.5,
         }
     ],
 )
@@ -235,61 +244,49 @@ check("no level records -> empty", out, [])
 
 # Summary counts.
 s = summary([
-    {"category": "walked_past"},
+    {"category": "hit"},
+    {"category": "hit"},
     {"category": "walked_past"},
     {"category": "unreached"},
 ])
 check(
-    "summary counts + frac_walked_past",
+    "summary counts + frac_hit",
     s,
-    {"total": 3.0, "walked_past": 2.0, "unreached": 1.0,
-     "frac_walked_past": 2.0 / 3.0},
+    {"total": 4.0, "hit": 2.0, "walked_past": 1.0, "unreached": 1.0,
+     "frac_hit": 0.5},
 )
 check("summary empty", summary([]),
-      {"total": 0.0, "walked_past": 0.0, "unreached": 0.0,
-       "frac_walked_past": 0.0})
+      {"total": 0.0, "hit": 0.0, "walked_past": 0.0, "unreached": 0.0,
+       "frac_hit": 0.0})
 
-# CSV writer.
+# CSV writer: exact column order per spec.
 csv_entries = [
-    {"out_pos": 101, "node": 2, "depth": 1, "token": 12,
-     "parent_node": 0, "parent_token": 100, "category": "walked_past",
+    {"output_pos": 101, "depth": 1, "parent_token": 100,
+     "category": "hit", "token": 11,
+     "draft_rank": 1, "draft_prob": 0.5,
+     "ngram_order": 3, "ngram_rank": 1, "ngram_prob": 0.9},
+    {"output_pos": 101, "depth": 1, "parent_token": 100,
+     "category": "walked_past", "token": 12,
      "draft_rank": 2, "draft_prob": math.exp(-0.5),
-     "ngram_rank": 2, "ngram_prob": 0.2, "ngram_order": 3},
-    {"out_pos": 102, "node": 4, "depth": 2, "token": 22,
-     "parent_node": 2, "parent_token": 12, "category": "unreached",
-     "draft_rank": 1, "draft_prob": math.exp(-0.3),
-     "ngram_rank": 2, "ngram_prob": 0.1, "ngram_order": 2},
+     "ngram_order": 2, "ngram_rank": 2, "ngram_prob": 0.2},
 ]
 with tempfile.TemporaryDirectory() as tmp:
     p = Path(tmp) / "out.csv"
     save(csv_entries, p)
     rows = list(csv.reader(p.open(encoding="utf-8", newline="")))
     assert rows[0] == [
-        "out_pos", "node", "depth", "token", "token_text",
-        "parent_node", "parent_token", "parent_token_text", "category",
-        "draft_rank", "draft_prob", "ngram_rank", "ngram_prob",
-        "ngram_order",
+        "output_pos", "depth", "parent_token", "category", "token",
+        "draft_rank", "draft_prob", "ngram_order", "ngram_rank",
+        "ngram_prob",
     ]
-    assert rows[1] == ["101", "2", "1", "12", "", "0", "100", "",
-                       "walked_past", "2", "0.606531", "2", "0.2", "3"]
-    assert rows[2] == ["102", "4", "2", "22", "", "2", "12", "",
-                       "unreached", "1", "0.740818", "2", "0.1", "2"]
+    assert rows[1] == ["101", "1", "100", "hit", "11",
+                       "1", "0.5", "3", "1", "0.9"]
+    assert rows[2] == ["101", "1", "100", "walked_past", "12",
+                       "2", "0.606531", "2", "2", "0.2"]
     assert len(rows) == 3
-    # with a tokenizer stub
-    class Tok:
-        def decode(self, ids):
-            return f"<{ids[0]}>"
-    save(
-        [{"out_pos": 101, "node": 2, "depth": 1, "token": 12,
-          "parent_node": 0, "parent_token": 100,
-          "category": "walked_past", "draft_rank": 2,
-          "draft_prob": 0.5, "ngram_rank": 2, "ngram_prob": 0.2,
-          "ngram_order": 3}],
-        p,
-        Tok(),
-    )
+    # with a png path: matplotlib missing -> scatter skipped, no crash
+    save(csv_entries, p, png_path=Path(tmp) / "scatter.png")
     rows = list(csv.reader(p.open(encoding="utf-8", newline="")))
-    assert rows[1] == ["101", "2", "1", "12", "<12>", "0", "100", "<100>",
-                       "walked_past", "2", "0.5", "2", "0.2", "3"]
+    assert len(rows) == 3
 
-print("\nALL UNWALKED CHECKS PASSED")
+print("\nALL TREE-TABLE CHECKS PASSED")

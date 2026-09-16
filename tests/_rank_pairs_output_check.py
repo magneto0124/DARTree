@@ -1,7 +1,7 @@
-"""Standalone smoke check for eval_dartree.rank_pair_summary / save_rank_pairs
-(no numpy / matplotlib / torch needed; exec'd from source with stubs)."""
+"""Standalone smoke check for eval_dartree.rank_pair_summary and
+_save_rank_scatter (no numpy / matplotlib / torch needed; exec'd from
+source with stubs)."""
 import ast
-import csv
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -12,7 +12,7 @@ funcs = {
     n.name: n
     for n in ast.walk(tree)
     if isinstance(n, ast.FunctionDef)
-    and n.name in ("rank_pair_summary", "save_rank_pairs")
+    and n.name in ("rank_pair_summary", "_save_rank_scatter")
 }
 
 
@@ -76,17 +76,18 @@ for name, fn in funcs.items():
     exec(compile(ast.Module(body=[fn], type_ignores=[]), f"<{name}>", "exec"), ns)
 
 summary = ns["rank_pair_summary"]
-save = ns["save_rank_pairs"]
+scatter = ns["_save_rank_scatter"]
 
+# hit entries carry the tree-table keys; rank_pair_summary only reads ranks
 pairs = [
-    {"out_pos": 10, "token": 123, "depth": 1, "draft_rank": 1, "ngram_rank": 3,
-     "draft_prob": 0.5, "ngram_prob": 0.2, "ngram_order": 3},
-    {"out_pos": 11, "token": 456, "depth": 2, "draft_rank": 2, "ngram_rank": 2,
-     "draft_prob": 0.25, "ngram_prob": 0.0, "ngram_order": 0},
-    {"out_pos": 12, "token": 789, "depth": 3, "draft_rank": 3, "ngram_rank": 1,
-     "draft_prob": 0.125, "ngram_prob": 0.8, "ngram_order": 2},
-    {"out_pos": 13, "token": 111, "depth": 4, "draft_rank": 4, "ngram_rank": 4,
-     "draft_prob": 0.0625, "ngram_prob": 0.1, "ngram_order": 3},
+    {"output_pos": 101, "depth": 1, "parent_token": 100,
+     "category": "hit", "token": 11, "draft_rank": 1, "ngram_rank": 3},
+    {"output_pos": 102, "depth": 2, "parent_token": 11,
+     "category": "hit", "token": 21, "draft_rank": 2, "ngram_rank": 2},
+    {"output_pos": 103, "depth": 3, "parent_token": 21,
+     "category": "hit", "token": 31, "draft_rank": 3, "ngram_rank": 1},
+    {"output_pos": 104, "depth": 4, "parent_token": 31,
+     "category": "hit", "token": 41, "draft_rank": 4, "ngram_rank": 4},
 ]
 s = summary(pairs)
 print("summary:", s)
@@ -101,26 +102,15 @@ assert summary([]) == {"n": 0.0}
 
 # constant series -> corrcoef would be NaN; guard must return 0.0
 s_const = summary(
-    [{"out_pos": i, "token": i, "draft_rank": 2, "ngram_rank": 2} for i in range(5)]
+    [{"draft_rank": 2, "ngram_rank": 2} for _ in range(5)]
 )
 assert s_const["n"] == 5.0 and s_const["pearson_rank_corr"] == 0.0
 
+# scatter: matplotlib absent -> skipped without crashing
 with tempfile.TemporaryDirectory() as tmp:
-    base = Path(tmp) / "out.json"
-    csv_path = base.with_suffix(".rank_pairs.csv")
-    png_path = base.with_suffix(".rank_pairs.png")
-    save(pairs, csv_path, png_path, tokenizer=None)
-    assert csv_path.exists(), "CSV must be written even without matplotlib"
-    assert not png_path.exists(), "PNG must be skipped when matplotlib is absent"
-    with csv_path.open(encoding="utf-8", newline="") as f:
-        rows = list(csv.reader(f))
-    assert rows[0] == [
-        "out_pos", "token", "token_text", "depth", "draft_rank",
-        "ngram_rank", "draft_prob", "ngram_prob", "ngram_order",
-    ]
-    assert rows[1] == ["10", "123", "", "1", "1", "3", "0.5", "0.2", "3"]
-    assert rows[2] == ["11", "456", "", "2", "2", "2", "0.25", "0", "0"]
-    assert rows[3] == ["12", "789", "", "3", "3", "1", "0.125", "0.8", "2"]
-    assert len(rows) == 5
+    png = Path(tmp) / "scatter.png"
+    scatter(pairs, png)
+    assert not png.exists(), "PNG must be skipped when matplotlib is absent"
+    scatter([], png)  # empty hit list must also be safe
 
-print("\nALL RANK-PAIRS OUTPUT CHECKS PASSED")
+print("\nALL RANK-SUMMARY/SCATTER CHECKS PASSED")

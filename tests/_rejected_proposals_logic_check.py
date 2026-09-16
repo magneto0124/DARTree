@@ -10,7 +10,6 @@ mapping, missing ngram tables, and the CSV writer.
 import ast
 import csv
 import math
-import sys
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -99,11 +98,10 @@ check(
     out,
     [
         {
-            "out_pos": 101, "next_token": 12,
-            "parent_node": 0, "parent_token": 100,
-            "outcome": "level_pruned", "cand_pos": 1, "child_depth": 1,
+            "output_pos": 101, "depth": 1, "parent_token": 100,
+            "outcome": "level_pruned", "token": 12,
             "draft_rank": 2, "draft_prob": math.exp(-0.5),
-            "ngram_rank": 2, "ngram_prob": 0.2, "ngram_order": 3,
+            "ngram_order": 3, "ngram_rank": 2, "ngram_prob": 0.2,
         }
     ],
 )
@@ -121,10 +119,8 @@ check(
     out,
     [
         {
-            "out_pos": 101, "next_token": 99,
-            "parent_node": 0, "parent_token": 100,
-            "child_depth": 1,
-            "outcome": "not_proposed",
+            "output_pos": 101, "depth": 1, "parent_token": 100,
+            "outcome": "not_proposed", "token": 99,
         }
     ],
 )
@@ -142,10 +138,8 @@ check(
     out,
     [
         {
-            "out_pos": 102, "next_token": 12,
-            "parent_node": 1, "parent_token": 11,
-            "child_depth": 2,
-            "outcome": "not_expanded",
+            "output_pos": 102, "depth": 2, "parent_token": 11,
+            "outcome": "not_expanded", "token": 12,
         }
     ],
 )
@@ -163,10 +157,8 @@ check(
     out,
     [
         {
-            "out_pos": 101, "next_token": 12,
-            "parent_node": 0, "parent_token": 100,
-            "child_depth": 1,
-            "outcome": "not_expanded",
+            "output_pos": 101, "depth": 1, "parent_token": 100,
+            "outcome": "not_expanded", "token": 12,
         }
     ],
 )
@@ -195,11 +187,10 @@ check(
     out,
     [
         {
-            "out_pos": 102, "next_token": 51,
-            "parent_node": 1, "parent_token": 31,
-            "outcome": "final_pruned", "cand_pos": 0, "child_depth": 2,
+            "output_pos": 102, "depth": 2, "parent_token": 31,
+            "outcome": "final_pruned", "token": 51,
             "draft_rank": 1, "draft_prob": math.exp(-0.2),
-            "ngram_rank": 1, "ngram_prob": 0.5, "ngram_order": 3,
+            "ngram_order": 3, "ngram_rank": 1, "ngram_prob": 0.5,
         }
     ],
 )
@@ -218,11 +209,10 @@ check(
     out,
     [
         {
-            "out_pos": 102, "next_token": 53,
-            "parent_node": 1, "parent_token": 31,
-            "outcome": "level_pruned", "cand_pos": 2, "child_depth": 2,
+            "output_pos": 102, "depth": 2, "parent_token": 31,
+            "outcome": "level_pruned", "token": 53,
             "draft_rank": 3, "draft_prob": math.exp(-1.0),
-            "ngram_rank": 3, "ngram_prob": 0.1, "ngram_order": 2,
+            "ngram_order": 2, "ngram_rank": 3, "ngram_prob": 0.1,
         }
     ],
 )
@@ -251,11 +241,10 @@ check(
     out,
     [
         {
-            "out_pos": 101, "next_token": 11,
-            "parent_node": 0, "parent_token": 100,
-            "outcome": "final_pruned", "cand_pos": 0, "child_depth": 1,
+            "output_pos": 101, "depth": 1, "parent_token": 100,
+            "outcome": "final_pruned", "token": 11,
             "draft_rank": 1, "draft_prob": math.exp(-0.1),
-            "ngram_rank": 0, "ngram_prob": 0.0, "ngram_order": 0,
+            "ngram_order": 0, "ngram_rank": 0, "ngram_prob": 0.0,
         }
     ],
 )
@@ -285,44 +274,28 @@ check("summary empty", summary([]),
       {"total": 0.0, "not_proposed": 0.0, "level_pruned": 0.0,
        "final_pruned": 0.0, "not_expanded": 0.0, "frac_proposed": 0.0})
 
-# 9) CSV writer.
+# 9) CSV writer: exact column order per spec.
 csv_entries = [
-    {"out_pos": 101, "next_token": 12, "parent_node": 0,
-     "parent_token": 100, "child_depth": 1, "outcome": "level_pruned",
+    {"output_pos": 101, "depth": 1, "parent_token": 100,
+     "outcome": "level_pruned", "token": 12,
      "draft_rank": 2, "draft_prob": math.exp(-0.5),
-     "ngram_rank": 2, "ngram_prob": 0.2, "ngram_order": 3},
-    {"out_pos": 102, "next_token": 99, "parent_node": 1,
-     "parent_token": 31, "child_depth": 2, "outcome": "not_proposed"},
+     "ngram_order": 3, "ngram_rank": 2, "ngram_prob": 0.2},
+    {"output_pos": 102, "depth": 2, "parent_token": 31,
+     "outcome": "not_proposed", "token": 99},
 ]
 with tempfile.TemporaryDirectory() as tmp:
     p = Path(tmp) / "out.csv"
     save(csv_entries, p)
     rows = list(csv.reader(p.open(encoding="utf-8", newline="")))
     assert rows[0] == [
-        "out_pos", "next_token", "token_text", "parent_node",
-        "parent_token", "parent_token_text", "outcome", "child_depth",
-        "draft_rank", "draft_prob", "ngram_rank", "ngram_prob",
-        "ngram_order",
+        "output_pos", "depth", "parent_token", "outcome", "token",
+        "draft_rank", "draft_prob", "ngram_order", "ngram_rank",
+        "ngram_prob",
     ]
-    assert rows[1] == ["101", "12", "", "0", "100", "", "level_pruned",
-                       "1", "2", "0.606531", "2", "0.2", "3"]
-    assert rows[2] == ["102", "99", "", "1", "31", "", "not_proposed",
-                       "2", "0", "0", "0", "0", "0"]
+    assert rows[1] == ["101", "1", "100", "level_pruned", "12",
+                       "2", "0.606531", "3", "2", "0.2"]
+    assert rows[2] == ["102", "2", "31", "not_proposed", "99",
+                       "0", "0", "0", "0", "0"]
     assert len(rows) == 3
-    # with a tokenizer stub
-    class Tok:
-        def decode(self, ids):
-            return f"<{ids[0]}>"
-    save(
-        [{"out_pos": 7, "next_token": 12, "parent_node": 1,
-          "parent_token": 31, "child_depth": 3, "outcome": "final_pruned",
-          "draft_rank": 1, "draft_prob": 0.5, "ngram_rank": 2,
-          "ngram_prob": 0.25, "ngram_order": 3}],
-        p,
-        Tok(),
-    )
-    rows = list(csv.reader(p.open(encoding="utf-8", newline="")))
-    assert rows[1] == ["7", "12", "<12>", "1", "31", "<31>",
-                       "final_pruned", "3", "1", "0.5", "2", "0.25", "3"]
 
 print("\nALL REJECTED-PROPOSALS CHECKS PASSED")
