@@ -1898,15 +1898,17 @@ def rank_pair_summary(pairs: list[dict[str, Any]]) -> dict[str, float]:
 def save_tree_table(
     entries: list[dict[str, Any]],
     csv_path: Path,
+    tokenizer: Any | None = None,
     png_path: Path | None = None,
 ) -> None:
     """Write one row per node of the pruned (final) tree: position, depth,
-    parent token, category (``hit`` / ``walked_past`` / ``unreached``),
-    token, and the token's draft / ngram statistics within the parent's
-    candidate row (ngram_order: 0 = no match, 2 = bigram, 3 = trigram;
-    ranks are 1-based, 1 = best).  When ``png_path`` is given, a scatter of
-    the accepted (hit) tokens' (draft rank, ngram rank) pairs with the
-    y = x diagonal is also written (matplotlib optional)."""
+    parent token (decoded text), category (``hit`` / ``walked_past`` /
+    ``unreached``), token (decoded text), and the token's draft / ngram
+    statistics within the parent's candidate row (ngram_order: 0 = no
+    match, 2 = bigram, 3 = trigram; ranks are 1-based, 1 = best).  When
+    ``png_path`` is given, a scatter of the accepted (hit) tokens' (draft
+    rank, ngram rank) pairs with the y = x diagonal is also written
+    (matplotlib optional)."""
     with csv_path.open("w", newline="", encoding="utf-8") as file:
         writer = csv.writer(file)
         writer.writerow(
@@ -1924,13 +1926,23 @@ def save_tree_table(
             ]
         )
         for e in entries:
+            token_id = int(e["token"])
+            parent_id = int(e["parent_token"])
             writer.writerow(
                 [
                     int(e["output_pos"]),
                     int(e["depth"]),
-                    int(e["parent_token"]),
+                    (
+                        tokenizer.decode([parent_id])
+                        if tokenizer is not None
+                        else ""
+                    ),
                     str(e.get("category", "unreached")),
-                    int(e["token"]),
+                    (
+                        tokenizer.decode([token_id])
+                        if tokenizer is not None
+                        else ""
+                    ),
                     int(e.get("draft_rank", 0)),
                     f"{float(e.get('draft_prob', 0.0)):.6g}",
                     int(e.get("ngram_order", 0)),
@@ -2015,13 +2027,14 @@ def rejected_proposal_summary(
 def save_rejected_proposals(
     entries: list[dict[str, Any]],
     csv_path: Path,
+    tokenizer: Any | None = None,
 ) -> None:
-    """Write one row per round: the rejected fallback token (the target's
-    own prediction at the last accepted node's slot), its would-be depth,
-    the rejecting parent's token, and the outcome (``not_proposed`` /
-    ``level_pruned`` / ``final_pruned`` / ``not_expanded``) plus the
-    token's draft / ngram statistics at the proposed position (zeros when
-    it was never proposed)."""
+    """Write one row per round: the rejected fallback token (decoded text;
+    the target's own prediction at the last accepted node's slot), its
+    would-be depth, the rejecting parent's token (decoded text), and the
+    outcome (``not_proposed`` / ``level_pruned`` / ``final_pruned`` /
+    ``not_expanded``) plus the token's draft / ngram statistics at the
+    proposed position (zeros when it was never proposed)."""
     with csv_path.open("w", newline="", encoding="utf-8") as file:
         writer = csv.writer(file)
         writer.writerow(
@@ -2039,13 +2052,23 @@ def save_rejected_proposals(
             ]
         )
         for e in entries:
+            token_id = int(e["token"])
+            parent_id = int(e["parent_token"])
             writer.writerow(
                 [
                     int(e["output_pos"]),
                     int(e["depth"]),
-                    int(e["parent_token"]),
+                    (
+                        tokenizer.decode([parent_id])
+                        if tokenizer is not None
+                        else ""
+                    ),
                     str(e.get("outcome", "not_proposed")),
-                    int(e["token"]),
+                    (
+                        tokenizer.decode([token_id])
+                        if tokenizer is not None
+                        else ""
+                    ),
                     int(e.get("draft_rank", 0)),
                     f"{float(e.get('draft_prob', 0.0)):.6g}",
                     int(e.get("ngram_order", 0)),
@@ -2599,6 +2622,7 @@ def main() -> None:
         save_tree_table(
             all_tree_table,
             out_path.with_suffix(".tree_table.csv"),
+            tokenizer,
             out_path.with_suffix(".rank_pairs.png"),
         )
         summary["tree_table"] = tree_table_summary(all_tree_table)
@@ -2612,6 +2636,7 @@ def main() -> None:
         save_rejected_proposals(
             all_rejected_proposals,
             Path(args.output).with_suffix(".rejected_proposals.csv"),
+            tokenizer,
         )
         summary["rejected_proposal"] = rejected_proposal_summary(
             all_rejected_proposals

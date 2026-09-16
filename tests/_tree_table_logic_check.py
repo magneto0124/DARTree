@@ -259,7 +259,8 @@ check("summary empty", summary([]),
       {"total": 0.0, "hit": 0.0, "walked_past": 0.0, "unreached": 0.0,
        "frac_hit": 0.0})
 
-# CSV writer: exact column order per spec.
+# CSV writer: exact column order per spec; token / parent_token are the
+# DECODED token text, not the token ids.
 csv_entries = [
     {"output_pos": 101, "depth": 1, "parent_token": 100,
      "category": "hit", "token": 11,
@@ -270,22 +271,29 @@ csv_entries = [
      "draft_rank": 2, "draft_prob": math.exp(-0.5),
      "ngram_order": 2, "ngram_rank": 2, "ngram_prob": 0.2},
 ]
+
+
+class Tok:
+    def decode(self, ids):
+        return f"<tok:{ids[0]}>"
+
+
 with tempfile.TemporaryDirectory() as tmp:
     p = Path(tmp) / "out.csv"
-    save(csv_entries, p)
+    save(csv_entries, p, Tok())
     rows = list(csv.reader(p.open(encoding="utf-8", newline="")))
     assert rows[0] == [
         "output_pos", "depth", "parent_token", "category", "token",
         "draft_rank", "draft_prob", "ngram_order", "ngram_rank",
         "ngram_prob",
     ]
-    assert rows[1] == ["101", "1", "100", "hit", "11",
+    assert rows[1] == ["101", "1", "<tok:100>", "hit", "<tok:11>",
                        "1", "0.5", "3", "1", "0.9"]
-    assert rows[2] == ["101", "1", "100", "walked_past", "12",
+    assert rows[2] == ["101", "1", "<tok:100>", "walked_past", "<tok:12>",
                        "2", "0.606531", "2", "2", "0.2"]
     assert len(rows) == 3
     # with a png path: matplotlib missing -> scatter skipped, no crash
-    save(csv_entries, p, png_path=Path(tmp) / "scatter.png")
+    save(csv_entries, p, Tok(), png_path=Path(tmp) / "scatter.png")
     rows = list(csv.reader(p.open(encoding="utf-8", newline="")))
     assert len(rows) == 3
 

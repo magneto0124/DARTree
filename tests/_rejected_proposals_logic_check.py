@@ -274,7 +274,8 @@ check("summary empty", summary([]),
       {"total": 0.0, "not_proposed": 0.0, "level_pruned": 0.0,
        "final_pruned": 0.0, "not_expanded": 0.0, "frac_proposed": 0.0})
 
-# 9) CSV writer: exact column order per spec.
+# 9) CSV writer: exact column order per spec; token / parent_token are the
+#    DECODED token text, not the token ids.
 csv_entries = [
     {"output_pos": 101, "depth": 1, "parent_token": 100,
      "outcome": "level_pruned", "token": 12,
@@ -283,18 +284,25 @@ csv_entries = [
     {"output_pos": 102, "depth": 2, "parent_token": 31,
      "outcome": "not_proposed", "token": 99},
 ]
+
+
+class Tok:
+    def decode(self, ids):
+        return f"<tok:{ids[0]}>"
+
+
 with tempfile.TemporaryDirectory() as tmp:
     p = Path(tmp) / "out.csv"
-    save(csv_entries, p)
+    save(csv_entries, p, Tok())
     rows = list(csv.reader(p.open(encoding="utf-8", newline="")))
     assert rows[0] == [
         "output_pos", "depth", "parent_token", "outcome", "token",
         "draft_rank", "draft_prob", "ngram_order", "ngram_rank",
         "ngram_prob",
     ]
-    assert rows[1] == ["101", "1", "100", "level_pruned", "12",
+    assert rows[1] == ["101", "1", "<tok:100>", "level_pruned", "<tok:12>",
                        "2", "0.606531", "3", "2", "0.2"]
-    assert rows[2] == ["102", "2", "31", "not_proposed", "99",
+    assert rows[2] == ["102", "2", "<tok:31>", "not_proposed", "<tok:99>",
                        "0", "0", "0", "0", "0"]
     assert len(rows) == 3
 
