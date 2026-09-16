@@ -99,12 +99,14 @@ check(
     [
         {
             "out_pos": 101, "token": 11,
+            "depth": 1,
             "draft_rank": 1, "ngram_rank": 1,
             "draft_prob": math.exp(-0.1), "ngram_prob": 0.5,
             "ngram_order": 3,
         },
         {
             "out_pos": 102, "token": 21,
+            "depth": 2,
             "draft_rank": 1, "ngram_rank": 2,
             "draft_prob": math.exp(-0.2), "ngram_prob": 0.3,
             "ngram_order": 2,  # bigram backoff for the accepted token
@@ -137,6 +139,7 @@ check(
     [
         {
             "out_pos": 101, "token": 8,
+            "depth": 1,
             "draft_rank": 1, "ngram_rank": 1,
             "draft_prob": math.exp(-0.5), "ngram_prob": 0.2,
             "ngram_order": 3,
@@ -156,6 +159,7 @@ check(
     [
         {
             "out_pos": 101, "token": 9,
+            "depth": 1,
             "draft_rank": 3, "ngram_rank": 3,
             "draft_prob": math.exp(-1.0), "ngram_prob": 0.0,
             "ngram_order": 0,
@@ -199,12 +203,14 @@ check(
     [
         {
             "out_pos": 101, "token": 31,
+            "depth": 1,
             "draft_rank": 1, "ngram_rank": 1,
             "draft_prob": math.exp(-0.1), "ngram_prob": 0.9,
             "ngram_order": 3,
         },
         {
             "out_pos": 102, "token": 51,
+            "depth": 2,
             "draft_rank": 1, "ngram_rank": 1,
             "draft_prob": math.exp(-0.2), "ngram_prob": 0.5,
             "ngram_order": 3,
@@ -254,6 +260,7 @@ check(
     [
         {
             "out_pos": 101, "token": 11,
+            "depth": 1,
             "draft_rank": 1, "ngram_rank": 1,
             "draft_prob": math.exp(-0.1), "ngram_prob": 0.5,
             "ngram_order": 0,

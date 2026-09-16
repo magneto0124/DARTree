@@ -123,6 +123,7 @@ check(
         {
             "out_pos": 101, "next_token": 99,
             "parent_node": 0, "parent_token": 100,
+            "child_depth": 1,
             "outcome": "not_proposed",
         }
     ],
@@ -143,6 +144,7 @@ check(
         {
             "out_pos": 102, "next_token": 12,
             "parent_node": 1, "parent_token": 11,
+            "child_depth": 2,
             "outcome": "not_expanded",
         }
     ],
@@ -163,6 +165,7 @@ check(
         {
             "out_pos": 101, "next_token": 12,
             "parent_node": 0, "parent_token": 100,
+            "child_depth": 1,
             "outcome": "not_expanded",
         }
     ],
@@ -285,11 +288,11 @@ check("summary empty", summary([]),
 # 9) CSV writer.
 csv_entries = [
     {"out_pos": 101, "next_token": 12, "parent_node": 0,
-     "parent_token": 100, "outcome": "level_pruned",
+     "parent_token": 100, "child_depth": 1, "outcome": "level_pruned",
      "draft_rank": 2, "draft_prob": math.exp(-0.5),
      "ngram_rank": 2, "ngram_prob": 0.2, "ngram_order": 3},
     {"out_pos": 102, "next_token": 99, "parent_node": 1,
-     "parent_token": 31, "outcome": "not_proposed"},
+     "parent_token": 31, "child_depth": 2, "outcome": "not_proposed"},
 ]
 with tempfile.TemporaryDirectory() as tmp:
     p = Path(tmp) / "out.csv"
@@ -297,14 +300,14 @@ with tempfile.TemporaryDirectory() as tmp:
     rows = list(csv.reader(p.open(encoding="utf-8", newline="")))
     assert rows[0] == [
         "out_pos", "next_token", "token_text", "parent_node",
-        "parent_token", "parent_token_text", "outcome",
+        "parent_token", "parent_token_text", "outcome", "child_depth",
         "draft_rank", "draft_prob", "ngram_rank", "ngram_prob",
         "ngram_order",
     ]
     assert rows[1] == ["101", "12", "", "0", "100", "", "level_pruned",
-                       "2", "0.606531", "2", "0.2", "3"]
+                       "1", "2", "0.606531", "2", "0.2", "3"]
     assert rows[2] == ["102", "99", "", "1", "31", "", "not_proposed",
-                       "0", "0", "0", "0", "0"]
+                       "2", "0", "0", "0", "0", "0"]
     assert len(rows) == 3
     # with a tokenizer stub
     class Tok:
@@ -312,7 +315,7 @@ with tempfile.TemporaryDirectory() as tmp:
             return f"<{ids[0]}>"
     save(
         [{"out_pos": 7, "next_token": 12, "parent_node": 1,
-          "parent_token": 31, "outcome": "final_pruned",
+          "parent_token": 31, "child_depth": 3, "outcome": "final_pruned",
           "draft_rank": 1, "draft_prob": 0.5, "ngram_rank": 2,
           "ngram_prob": 0.25, "ngram_order": 3}],
         p,
@@ -320,6 +323,6 @@ with tempfile.TemporaryDirectory() as tmp:
     )
     rows = list(csv.reader(p.open(encoding="utf-8", newline="")))
     assert rows[1] == ["7", "12", "<12>", "1", "31", "<31>",
-                       "final_pruned", "1", "0.5", "2", "0.25", "3"]
+                       "final_pruned", "3", "1", "0.5", "2", "0.25", "3"]
 
 print("\nALL REJECTED-PROPOSALS CHECKS PASSED")
