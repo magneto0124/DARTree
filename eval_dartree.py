@@ -349,8 +349,10 @@ def _collect_tree_table(
             {
                 "output_pos": int(start) + depth,
                 "depth": int(depth),
+                "parent_node": int(parent_new),
                 "parent_token": int(verify_input_ids[0, parent_new]),
                 "category": category,
+                "node": int(node),
                 "token": token_id,
                 "draft_rank": int(draft_rank),
                 "draft_prob": float(np.exp(draft_logprobs[cand_pos])),
@@ -415,6 +417,7 @@ def _collect_rejected_proposals(
         "output_pos": int(start) + len(accepted_indices),
         # depth of the would-be child (parent depth + 1)
         "depth": int(child_depth),
+        "parent_node": int(parent_new),
         "parent_token": parent_token,
         "token": int(next_token),
     }
@@ -1932,21 +1935,23 @@ def save_tree_table(
     png_path: Path | None = None,
 ) -> None:
     """Write one row per node of the pruned (final) tree: position, depth,
-    parent token (decoded text), category (``hit`` / ``walked_past`` /
-    ``unreached``), token (decoded text), and the token's draft / ngram
-    statistics within the parent's candidate row (ngram_order: 0 = no
-    match, 2 = bigram, 3 = trigram; ranks are 1-based, 1 = best).  When
-    ``png_path`` is given, a scatter of the accepted (hit) tokens' (draft
-    rank, ngram rank) pairs with the y = x diagonal is also written
-    (matplotlib optional)."""
+    parent node id + parent token (decoded text), category (``hit`` /
+    ``walked_past`` / ``unreached``), node id + token (decoded text), and
+    the token's draft / ngram statistics within the parent's candidate row
+    (ngram_order: 0 = no match, 2 = bigram, 3 = trigram; ranks are
+    1-based, 1 = best).  When ``png_path`` is given, a scatter of the
+    accepted (hit) tokens' (draft rank, ngram rank) pairs with the y = x
+    diagonal is also written (matplotlib optional)."""
     with csv_path.open("w", newline="", encoding="utf-8") as file:
         writer = csv.writer(file)
         writer.writerow(
             [
                 "output_pos",
                 "depth",
+                "parent_node",
                 "parent_token",
                 "category",
+                "node",
                 "token",
                 "draft_rank",
                 "draft_prob",
@@ -1962,12 +1967,14 @@ def save_tree_table(
                 [
                     int(e["output_pos"]),
                     int(e["depth"]),
+                    int(e["parent_node"]),
                     (
                         tokenizer.decode([parent_id])
                         if tokenizer is not None
                         else ""
                     ),
                     str(e.get("category", "unreached")),
+                    int(e["node"]),
                     (
                         tokenizer.decode([token_id])
                         if tokenizer is not None
@@ -2061,9 +2068,9 @@ def save_rejected_proposals(
 ) -> None:
     """Write one row per round: the rejected fallback token (decoded text;
     the target's own prediction at the last accepted node's slot), its
-    would-be depth, the rejecting parent's token (decoded text), and the
-    outcome (``not_proposed`` / ``level_pruned`` / ``final_pruned`` /
-    ``not_expanded``) plus the token's draft / ngram statistics at the
+    would-be depth, the rejecting parent's node id + token (decoded text),
+    and the outcome (``not_proposed`` / ``level_pruned`` / ``final_pruned``
+    / ``not_expanded``) plus the token's draft / ngram statistics at the
     proposed position (zeros when it was never proposed)."""
     with csv_path.open("w", newline="", encoding="utf-8") as file:
         writer = csv.writer(file)
@@ -2071,6 +2078,7 @@ def save_rejected_proposals(
             [
                 "output_pos",
                 "depth",
+                "parent_node",
                 "parent_token",
                 "outcome",
                 "token",
@@ -2088,6 +2096,7 @@ def save_rejected_proposals(
                 [
                     int(e["output_pos"]),
                     int(e["depth"]),
+                    int(e["parent_node"]),
                     (
                         tokenizer.decode([parent_id])
                         if tokenizer is not None

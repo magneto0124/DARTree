@@ -106,26 +106,30 @@ check(
     out,
     [
         {
-            "output_pos": 101, "depth": 1, "parent_token": 100,
-            "category": "hit", "token": 11,
+            "output_pos": 101, "depth": 1,
+            "parent_node": 0, "parent_token": 100,
+            "category": "hit", "node": 1, "token": 11,
             "draft_rank": 1, "draft_prob": math.exp(-0.1),
             "ngram_order": 3, "ngram_rank": 1, "ngram_prob": 0.5,
         },
         {
-            "output_pos": 101, "depth": 1, "parent_token": 100,
-            "category": "walked_past", "token": 12,
+            "output_pos": 101, "depth": 1,
+            "parent_node": 0, "parent_token": 100,
+            "category": "walked_past", "node": 2, "token": 12,
             "draft_rank": 2, "draft_prob": math.exp(-0.5),
             "ngram_order": 3, "ngram_rank": 2, "ngram_prob": 0.2,
         },
         {
-            "output_pos": 102, "depth": 2, "parent_token": 11,
-            "category": "walked_past", "token": 21,
+            "output_pos": 102, "depth": 2,
+            "parent_node": 1, "parent_token": 11,
+            "category": "walked_past", "node": 3, "token": 21,
             "draft_rank": 1, "draft_prob": math.exp(-0.2),
             "ngram_order": 3, "ngram_rank": 2, "ngram_prob": 0.3,
         },
         {
-            "output_pos": 102, "depth": 2, "parent_token": 12,
-            "category": "unreached", "token": 22,
+            "output_pos": 102, "depth": 2,
+            "parent_node": 2, "parent_token": 12,
+            "category": "unreached", "node": 4, "token": 22,
             "draft_rank": 1, "draft_prob": math.exp(-0.3),
             # ngram row [0.1, 0.9, 0.2]: 0.9 and 0.2 are strictly better
             "ngram_order": 2, "ngram_rank": 3, "ngram_prob": 0.1,
@@ -146,14 +150,16 @@ check(
     out,
     [
         {
-            "output_pos": 101, "depth": 1, "parent_token": 100,
-            "category": "walked_past", "token": 11,
+            "output_pos": 101, "depth": 1,
+            "parent_node": 0, "parent_token": 100,
+            "category": "walked_past", "node": 1, "token": 11,
             "draft_rank": 1, "draft_prob": math.exp(-0.1),
             "ngram_order": 3, "ngram_rank": 1, "ngram_prob": 0.5,
         },
         {
-            "output_pos": 101, "depth": 1, "parent_token": 100,
-            "category": "walked_past", "token": 12,
+            "output_pos": 101, "depth": 1,
+            "parent_node": 0, "parent_token": 100,
+            "category": "walked_past", "node": 2, "token": 12,
             "draft_rank": 2, "draft_prob": math.exp(-0.5),
             "ngram_order": 3, "ngram_rank": 2, "ngram_prob": 0.2,
         },
@@ -193,20 +199,23 @@ check(
     out,
     [
         {
-            "output_pos": 101, "depth": 1, "parent_token": 100,
-            "category": "hit", "token": 31,
+            "output_pos": 101, "depth": 1,
+            "parent_node": 0, "parent_token": 100,
+            "category": "hit", "node": 1, "token": 31,
             "draft_rank": 1, "draft_prob": math.exp(-0.1),
             "ngram_order": 3, "ngram_rank": 1, "ngram_prob": 0.9,
         },
         {
-            "output_pos": 102, "depth": 2, "parent_token": 31,
-            "category": "walked_past", "token": 51,
+            "output_pos": 102, "depth": 2,
+            "parent_node": 1, "parent_token": 31,
+            "category": "walked_past", "node": 2, "token": 51,
             "draft_rank": 1, "draft_prob": math.exp(-0.2),
             "ngram_order": 3, "ngram_rank": 1, "ngram_prob": 0.5,
         },
         {
-            "output_pos": 102, "depth": 2, "parent_token": 31,
-            "category": "walked_past", "token": 52,
+            "output_pos": 102, "depth": 2,
+            "parent_node": 1, "parent_token": 31,
+            "category": "walked_past", "node": 3, "token": 52,
             "draft_rank": 2, "draft_prob": math.exp(-0.8),
             "ngram_order": 3, "ngram_rank": 2, "ngram_prob": 0.4,
         },
@@ -226,8 +235,9 @@ check(
     out,
     [
         {
-            "output_pos": 101, "depth": 1, "parent_token": 100,
-            "category": "walked_past", "token": 11,
+            "output_pos": 101, "depth": 1,
+            "parent_node": 0, "parent_token": 100,
+            "category": "walked_past", "node": 1, "token": 11,
             "draft_rank": 1, "draft_prob": math.exp(-0.1),
             "ngram_order": 3, "ngram_rank": 1, "ngram_prob": 0.5,
         }
@@ -260,14 +270,16 @@ check("summary empty", summary([]),
        "frac_hit": 0.0})
 
 # CSV writer: exact column order per spec; token / parent_token are the
-# DECODED token text, not the token ids.
+# DECODED token text, not the token ids; node ids sit before their tokens.
 csv_entries = [
-    {"output_pos": 101, "depth": 1, "parent_token": 100,
-     "category": "hit", "token": 11,
+    {"output_pos": 101, "depth": 1,
+     "parent_node": 0, "parent_token": 100,
+     "category": "hit", "node": 1, "token": 11,
      "draft_rank": 1, "draft_prob": 0.5,
      "ngram_order": 3, "ngram_rank": 1, "ngram_prob": 0.9},
-    {"output_pos": 101, "depth": 1, "parent_token": 100,
-     "category": "walked_past", "token": 12,
+    {"output_pos": 101, "depth": 1,
+     "parent_node": 0, "parent_token": 100,
+     "category": "walked_past", "node": 2, "token": 12,
      "draft_rank": 2, "draft_prob": math.exp(-0.5),
      "ngram_order": 2, "ngram_rank": 2, "ngram_prob": 0.2},
 ]
@@ -283,13 +295,15 @@ with tempfile.TemporaryDirectory() as tmp:
     save(csv_entries, p, Tok())
     rows = list(csv.reader(p.open(encoding="utf-8", newline="")))
     assert rows[0] == [
-        "output_pos", "depth", "parent_token", "category", "token",
+        "output_pos", "depth", "parent_node", "parent_token", "category",
+        "node", "token",
         "draft_rank", "draft_prob", "ngram_order", "ngram_rank",
         "ngram_prob",
     ]
-    assert rows[1] == ["101", "1", "<tok:100>", "hit", "<tok:11>",
+    assert rows[1] == ["101", "1", "0", "<tok:100>", "hit", "1", "<tok:11>",
                        "1", "0.5", "3", "1", "0.9"]
-    assert rows[2] == ["101", "1", "<tok:100>", "walked_past", "<tok:12>",
+    assert rows[2] == ["101", "1", "0", "<tok:100>", "walked_past",
+                       "2", "<tok:12>",
                        "2", "0.606531", "2", "2", "0.2"]
     assert len(rows) == 3
     # with a png path: matplotlib missing -> scatter skipped, no crash

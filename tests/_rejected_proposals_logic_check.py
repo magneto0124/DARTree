@@ -98,7 +98,8 @@ check(
     out,
     [
         {
-            "output_pos": 101, "depth": 1, "parent_token": 100,
+            "output_pos": 101, "depth": 1,
+            "parent_node": 0, "parent_token": 100,
             "outcome": "level_pruned", "token": 12,
             "draft_rank": 2, "draft_prob": math.exp(-0.5),
             "ngram_order": 3, "ngram_rank": 2, "ngram_prob": 0.2,
@@ -119,7 +120,8 @@ check(
     out,
     [
         {
-            "output_pos": 101, "depth": 1, "parent_token": 100,
+            "output_pos": 101, "depth": 1,
+            "parent_node": 0, "parent_token": 100,
             "outcome": "not_proposed", "token": 99,
         }
     ],
@@ -138,7 +140,8 @@ check(
     out,
     [
         {
-            "output_pos": 102, "depth": 2, "parent_token": 11,
+            "output_pos": 102, "depth": 2,
+            "parent_node": 1, "parent_token": 11,
             "outcome": "not_expanded", "token": 12,
         }
     ],
@@ -157,7 +160,8 @@ check(
     out,
     [
         {
-            "output_pos": 101, "depth": 1, "parent_token": 100,
+            "output_pos": 101, "depth": 1,
+            "parent_node": 0, "parent_token": 100,
             "outcome": "not_expanded", "token": 12,
         }
     ],
@@ -187,7 +191,8 @@ check(
     out,
     [
         {
-            "output_pos": 102, "depth": 2, "parent_token": 31,
+            "output_pos": 102, "depth": 2,
+            "parent_node": 1, "parent_token": 31,
             "outcome": "final_pruned", "token": 51,
             "draft_rank": 1, "draft_prob": math.exp(-0.2),
             "ngram_order": 3, "ngram_rank": 1, "ngram_prob": 0.5,
@@ -209,7 +214,8 @@ check(
     out,
     [
         {
-            "output_pos": 102, "depth": 2, "parent_token": 31,
+            "output_pos": 102, "depth": 2,
+            "parent_node": 1, "parent_token": 31,
             "outcome": "level_pruned", "token": 53,
             "draft_rank": 3, "draft_prob": math.exp(-1.0),
             "ngram_order": 2, "ngram_rank": 3, "ngram_prob": 0.1,
@@ -241,7 +247,8 @@ check(
     out,
     [
         {
-            "output_pos": 101, "depth": 1, "parent_token": 100,
+            "output_pos": 101, "depth": 1,
+            "parent_node": 0, "parent_token": 100,
             "outcome": "final_pruned", "token": 11,
             "draft_rank": 1, "draft_prob": math.exp(-0.1),
             "ngram_order": 0, "ngram_rank": 0, "ngram_prob": 0.0,
@@ -275,13 +282,16 @@ check("summary empty", summary([]),
        "final_pruned": 0.0, "not_expanded": 0.0, "frac_proposed": 0.0})
 
 # 9) CSV writer: exact column order per spec; token / parent_token are the
-#    DECODED token text, not the token ids.
+#    DECODED token text, not the token ids; parent node id sits before its
+#    token.
 csv_entries = [
-    {"output_pos": 101, "depth": 1, "parent_token": 100,
+    {"output_pos": 101, "depth": 1,
+     "parent_node": 0, "parent_token": 100,
      "outcome": "level_pruned", "token": 12,
      "draft_rank": 2, "draft_prob": math.exp(-0.5),
      "ngram_order": 3, "ngram_rank": 2, "ngram_prob": 0.2},
-    {"output_pos": 102, "depth": 2, "parent_token": 31,
+    {"output_pos": 102, "depth": 2,
+     "parent_node": 1, "parent_token": 31,
      "outcome": "not_proposed", "token": 99},
 ]
 
@@ -296,13 +306,16 @@ with tempfile.TemporaryDirectory() as tmp:
     save(csv_entries, p, Tok())
     rows = list(csv.reader(p.open(encoding="utf-8", newline="")))
     assert rows[0] == [
-        "output_pos", "depth", "parent_token", "outcome", "token",
+        "output_pos", "depth", "parent_node", "parent_token", "outcome",
+        "token",
         "draft_rank", "draft_prob", "ngram_order", "ngram_rank",
         "ngram_prob",
     ]
-    assert rows[1] == ["101", "1", "<tok:100>", "level_pruned", "<tok:12>",
+    assert rows[1] == ["101", "1", "0", "<tok:100>", "level_pruned",
+                       "<tok:12>",
                        "2", "0.606531", "3", "2", "0.2"]
-    assert rows[2] == ["102", "2", "<tok:31>", "not_proposed", "<tok:99>",
+    assert rows[2] == ["102", "2", "1", "<tok:31>", "not_proposed",
+                       "<tok:99>",
                        "0", "0", "0", "0", "0"]
     assert len(rows) == 3
 
