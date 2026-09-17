@@ -42,7 +42,7 @@ def load_and_process_dataset(data_name: str):
         dataset = dataset.map(lambda x: {"turns": [x["formatted_input"]]})
     elif data_name == "mt-bench":
         # dataset = load_dataset("HuggingFaceH4/mt_bench_prompts", split="train")
-        dataset = load_dataset("parquet", data_files={"train": "/home/l00937960/dataset/mt_bench/train-00000-of-00001-67c6c9fef07685a3.parquet"}, split="train")
+        dataset = load_dataset("parquet", data_files={"train": "/home/l00937960/dataset/mt-bench/train-00000-of-00001-67c6c9fef07685a3.parquet"}, split="train")
         dataset = dataset.map(lambda x: {"turns": x["prompt"]})
     elif data_name == "humaneval":
         # dataset = load_dataset("openai/openai_humaneval", split="test")
