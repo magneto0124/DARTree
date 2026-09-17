@@ -5,6 +5,7 @@ import argparse
 import csv
 import hashlib
 import json
+import math
 import random
 import time
 from collections import defaultdict
@@ -44,6 +45,12 @@ REPO_ROOT = Path(__file__).resolve().parent
 
 
 STAGE_NAMES = ("draft", "tree_build", "tree_setup", "verify", "commit")
+
+
+# less-width: rank-penalty base for candidate tokens.  The k-th best token
+# of a parent (1-based rank k) has its probability scaled by
+# TOPK_RANK_PENALTY_BASE ** (k - 1) before the path score is summed.
+TOPK_RANK_PENALTY_BASE = 0.9
 
 
 def stage_dict() -> dict[str, float]:
@@ -965,6 +972,23 @@ def build_dartree_supertree(
                 rank_levels[-1]["contexts"] = ngram_ctx
                 rank_levels[-1]["ngram_matched"] = matched_rows
             top_scores = w_level * (w_logit * top_scores + ngram_weight * s_ng)
+
+        # less-width: rank penalty.  Each candidate's probability is scaled
+        # by TOPK_RANK_PENALTY_BASE ** (k - 1), k being its 1-based rank
+        # within the parent's top-k (best token keeps 1.0, 2nd *0.9, ...).
+        # In log space this adds (k - 1) * ln(base) to the token score
+        # before the path sum, so lower-ranked tokens need to make up the
+        # penalty through later tokens and deep branches via them lose out.
+        # Ranks come from the score ordering itself (double argsort), so the
+        # penalty is correct even when the precomputed candidate table is
+        # returned unsorted (k >= candidate_count with sort_result=False).
+        candidate_ranks = (
+            torch.argsort(torch.argsort(-top_scores, dim=-1), dim=-1).float()
+            + 1.0
+        )
+        top_scores = top_scores + (
+            candidate_ranks - 1.0
+        ) * math.log(TOPK_RANK_PENALTY_BASE)
 
         t_select = detail_start(detail_times, device)
         scored_candidate_count = int(top_scores.shape[1])
