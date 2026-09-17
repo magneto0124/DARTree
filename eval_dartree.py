@@ -645,6 +645,7 @@ def build_dartree_supertree(
     prefix_len: int,
     supertree_width: int,
     depth_bonus: float,
+    nnt_lambda: float = NNT_MIX_LAMBDA,
     correction_scorer: DominoCorrectionScorer,
     z_parts: torch.Tensor,
     candidate_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None],
@@ -915,7 +916,7 @@ def build_dartree_supertree(
         # candidates under the GRANDPARENT's context -- from the grandparent,
         # the current child token is the next-next token -- then blend the two
         # conditional probabilities in probability space:
-        #   s'(c) = log(λ·p(c|p) + (1-λ)·p(c|g)),  λ = NNT_MIX_LAMBDA
+        #   s'(c) = log(λ·p(c|p) + (1-λ)·p(c|g)),  λ = nnt_lambda
         # p(c|p) is the parent-refined score computed above; p(c|g) is the
         # same candidate table scored with the grandparent hidden state.
         # Grandparent scores are computed once per unique grandparent and
@@ -961,8 +962,8 @@ def build_dartree_supertree(
             )
             blend_max = torch.maximum(top_scores, log_p_g)
             top_scores = blend_max + torch.log(
-                NNT_MIX_LAMBDA * torch.exp(top_scores - blend_max)
-                + (1.0 - NNT_MIX_LAMBDA) * torch.exp(log_p_g - blend_max)
+                float(nnt_lambda) * torch.exp(top_scores - blend_max)
+                + (1.0 - float(nnt_lambda)) * torch.exp(log_p_g - blend_max)
             )
 
         # DART-style continuity-aware scoring (Algorithm 1 / App. D):
@@ -1333,6 +1334,7 @@ def dartree_generate(
     stop_token_ids: list[int] | None,
     ngram_model: Any | None = None,
     ngram_weight: float = 0.0,
+    nnt_lambda: float = NNT_MIX_LAMBDA,
     record_round_trace: bool = False,
     record_entropy: bool = False,
     record_rank_pairs: bool = False,
@@ -1618,6 +1620,7 @@ def dartree_generate(
             prefix_len=prefix_len,
             supertree_width=supertree_width,
             depth_bonus=depth_bonus,
+            nnt_lambda=nnt_lambda,
             correction_scorer=correction_scorer,
             z_parts=z_parts,
             candidate_tables=candidate_tables,
@@ -2303,6 +2306,15 @@ def parse_args() -> argparse.Namespace:
         "--depth-bonus", type=float
     )
     parser.add_argument(
+        "--nnt-lambda", type=float, default=NNT_MIX_LAMBDA,
+        help=(
+            "NNT (next-next-token) correction mixture weight in [0, 1]: "
+            "s'(c) = log(λ·p(c|p) + (1-λ)·p(c|g)), where p(c|g) is the "
+            "grandparent-view score of the child candidate. 1 disables the "
+            "correction (default: " + str(NNT_MIX_LAMBDA) + ")."
+        ),
+    )
+    parser.add_argument(
         "--ngram-model", type=str, default=None,
         help=(
             "Path to a DART-format .trie n-gram model, loaded via "
@@ -2391,6 +2403,10 @@ def validate_contract(args: argparse.Namespace) -> None:
             raise ValueError(f"{name} must be positive")
     if float(args.ngram_weight) < 0:
         raise ValueError("--ngram-weight must be non-negative")
+    if not 0.0 <= float(args.nnt_lambda) <= 1.0:
+        raise ValueError(
+            "--nnt-lambda must be within [0, 1]"
+        )
     if int(args.candidate_vocab_size) < int(args.expansion_k):
         raise ValueError(
             "--candidate-vocab-size must be at least --expansion-k"
@@ -2621,6 +2637,7 @@ def main() -> None:
                 ],
                 ngram_model=ngram_model,
                 ngram_weight=args.ngram_weight,
+                nnt_lambda=args.nnt_lambda,
                 record_round_trace=(
                     args.record_round_trace
                 ),

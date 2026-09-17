@@ -36,6 +36,14 @@ def main() -> None:
     parser.add_argument("--ngram-model", default=None)
     parser.add_argument("--ngram-weight", type=float, default=0.0)
     parser.add_argument(
+        "--nnt-lambda", type=float, default=None,
+        help=(
+            "NNT (next-next-token) correction mixture weight in [0, 1]; "
+            "defaults to eval_dartree's NNT_MIX_LAMBDA. 1 disables the "
+            "correction."
+        ),
+    )
+    parser.add_argument(
         "--renorm-ngram", action="store_true",
         help=(
             "Renormalize each parent's ngram candidate probabilities over "
@@ -63,7 +71,13 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    from eval_dartree import main as evaluate
+    from eval_dartree import NNT_MIX_LAMBDA, main as evaluate
+
+    nnt_lambda = (
+        float(args.nnt_lambda)
+        if args.nnt_lambda is not None
+        else NNT_MIX_LAMBDA
+    )
 
     max_samples = (
         args.max_samples
@@ -91,6 +105,7 @@ def main() -> None:
         "--temperature", str(args.temperature),
         "--device", args.device,
         "--ngram-weight", str(args.ngram_weight),
+        "--nnt-lambda", str(nnt_lambda),
         "--output", output,
     ]
     if args.ngram_model:
