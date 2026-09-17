@@ -46,6 +46,12 @@ REPO_ROOT = Path(__file__).resolve().parent
 STAGE_NAMES = ("draft", "tree_build", "tree_setup", "verify", "commit")
 
 
+# NNT (next-next-token) correction: probability-space mixture weight used to
+# re-score a parent's top-k child candidates with the grandparent's
+# distribution.  s'(c) = log(λ·p(c|p) + (1-λ)·p(c|g)); λ = 1 disables it.
+NNT_MIX_LAMBDA = 0.5
+
+
 def stage_dict() -> dict[str, float]:
     return {name: 0.0 for name in STAGE_NAMES}
 
@@ -903,6 +909,60 @@ def build_dartree_supertree(
                     # selected pair below gets old id base + 1 + j
                     "base_node_id": int(node_count),
                 }
+            )
+
+        # NNT correction (next-next-token view): re-score the parent's top-k
+        # candidates under the GRANDPARENT's context -- from the grandparent,
+        # the current child token is the next-next token -- then blend the two
+        # conditional probabilities in probability space:
+        #   s'(c) = log(λ·p(c|p) + (1-λ)·p(c|g)),  λ = NNT_MIX_LAMBDA
+        # p(c|p) is the parent-refined score computed above; p(c|g) is the
+        # same candidate table scored with the grandparent hidden state.
+        # Grandparent scores are computed once per unique grandparent and
+        # gathered (siblings share a grandparent).  Skipped at depth 1 (no
+        # grandparent) and on the base-logits path (slot < prefix_len), where
+        # both views are identical so the blend would be a no-op.
+        if child_depth >= 2 and slot >= prefix_len:
+            cids, cbase, cw, cbias = candidate_tables
+            cids_slot = cids[slot]
+            table_size = int(cids_slot.numel())
+            grandparent_indices = parents_t[parent_indices]
+            unique_g, inverse = torch.unique(
+                grandparent_indices, return_inverse=True
+            )
+            g_hidden = hidden_states.index_select(0, unique_g)
+            z_g = z_parts[:, slot : slot + 1, :].expand(
+                int(unique_g.numel()), -1, -1
+            )[:, 0, :]
+            bias_g = None if cbias is None else cbias[slot]
+            full_vals_g, _, log_z_g = (
+                correction_scorer.candidate_topk_from_precomputed(
+                    z_g,
+                    g_hidden,
+                    cids_slot,
+                    cbase[slot],
+                    cw[slot],
+                    bias_g,
+                    table_size,
+                    sort_result=False,
+                    compute_log_z=True,
+                )
+            )
+            # Full-table log-probs of every candidate token per unique
+            # grandparent (table order); align the parent's top-k tokens to
+            # their table positions via searchsorted on the negated
+            # (descending) candidate-id table.
+            log_p_g_full = full_vals_g.float() - log_z_g.float()
+            table_pos = torch.searchsorted(-cids_slot, -top_ids)
+            log_p_g = torch.gather(
+                log_p_g_full.index_select(0, inverse),
+                1,
+                table_pos,
+            )
+            blend_max = torch.maximum(top_scores, log_p_g)
+            top_scores = blend_max + torch.log(
+                NNT_MIX_LAMBDA * torch.exp(top_scores - blend_max)
+                + (1.0 - NNT_MIX_LAMBDA) * torch.exp(log_p_g - blend_max)
             )
 
         # DART-style continuity-aware scoring (Algorithm 1 / App. D):
