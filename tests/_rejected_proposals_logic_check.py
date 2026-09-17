@@ -1,11 +1,13 @@
 """Standalone logic test for eval_dartree._collect_rejected_proposals,
-rejected_proposal_summary and save_rejected_proposals (no torch needed).
+rejected_proposal_summary and the merged save_tree_table reject-row handling
+(no torch needed).
 
 Covers: root-only rejection, not_proposed (token never in the parent's
 top-k row), not_expanded (parent at max depth), level_pruned (proposed but
 not selected at this level), final_pruned (selected into the pre-prune tree
 but dropped by the whole-tree prune), pruned-variant new<->old parent
-mapping, missing ngram tables, and the CSV writer.
+mapping, missing ngram tables, and the merged CSV writer (reject rows carry
+category instead of a tree node id, node = "/").
 """
 import ast
 import csv
@@ -17,7 +19,7 @@ from typing import Any
 SRC = open("eval_dartree.py", encoding="utf-8").read()
 tree = ast.parse(SRC)
 names = ["_collect_rejected_proposals", "rejected_proposal_summary",
-         "save_rejected_proposals"]
+         "save_tree_table"]
 fns = [
     next(n for n in ast.walk(tree)
          if isinstance(n, ast.FunctionDef) and n.name == name)
@@ -33,7 +35,7 @@ ns = {
 exec(compile(ast.Module(body=fns, type_ignores=[]), "<fns>", "exec"), ns)
 collect = ns["_collect_rejected_proposals"]
 summary = ns["rejected_proposal_summary"]
-save = ns["save_rejected_proposals"]
+save = ns["save_tree_table"]
 
 
 class VID:
@@ -55,9 +57,11 @@ def check(name, got, want):
         raise SystemExit(f"FAILED: {name}")
 
 
-def run(next_token, accepted, depths, vid_tokens, stats, start=100):
+def run(next_token, accepted, depths, vid_tokens, stats, start=100,
+        round_index=0):
     sink: list[dict[str, Any]] = []
     collect(
+        round_index=round_index,
         next_token=next_token,
         accepted_indices=accepted,
         node_depths=depths,
@@ -98,9 +102,9 @@ check(
     out,
     [
         {
-            "output_pos": 101, "depth": 1,
+            "round": 0, "output_pos": 101, "depth": 1,
             "parent_node": 0, "parent_token": 100,
-            "outcome": "level_pruned", "token": 12,
+            "category": "level_pruned", "token": 12,
             "draft_rank": 2, "draft_prob": math.exp(-0.5),
             "ngram_order": 3, "ngram_rank": 2, "ngram_prob": 0.2,
         }
@@ -120,9 +124,9 @@ check(
     out,
     [
         {
-            "output_pos": 101, "depth": 1,
+            "round": 0, "output_pos": 101, "depth": 1,
             "parent_node": 0, "parent_token": 100,
-            "outcome": "not_proposed", "token": 99,
+            "category": "not_proposed", "token": 99,
         }
     ],
 )
@@ -140,9 +144,9 @@ check(
     out,
     [
         {
-            "output_pos": 102, "depth": 2,
+            "round": 0, "output_pos": 102, "depth": 2,
             "parent_node": 1, "parent_token": 11,
-            "outcome": "not_expanded", "token": 12,
+            "category": "not_expanded", "token": 12,
         }
     ],
 )
@@ -160,9 +164,9 @@ check(
     out,
     [
         {
-            "output_pos": 101, "depth": 1,
+            "round": 0, "output_pos": 101, "depth": 1,
             "parent_node": 0, "parent_token": 100,
-            "outcome": "not_expanded", "token": 12,
+            "category": "not_expanded", "token": 12,
         }
     ],
 )
@@ -191,9 +195,9 @@ check(
     out,
     [
         {
-            "output_pos": 102, "depth": 2,
+            "round": 0, "output_pos": 102, "depth": 2,
             "parent_node": 1, "parent_token": 31,
-            "outcome": "final_pruned", "token": 51,
+            "category": "final_pruned", "token": 51,
             "draft_rank": 1, "draft_prob": math.exp(-0.2),
             "ngram_order": 3, "ngram_rank": 1, "ngram_prob": 0.5,
         }
@@ -214,9 +218,9 @@ check(
     out,
     [
         {
-            "output_pos": 102, "depth": 2,
+            "round": 0, "output_pos": 102, "depth": 2,
             "parent_node": 1, "parent_token": 31,
-            "outcome": "level_pruned", "token": 53,
+            "category": "level_pruned", "token": 53,
             "draft_rank": 3, "draft_prob": math.exp(-1.0),
             "ngram_order": 2, "ngram_rank": 3, "ngram_prob": 0.1,
         }
@@ -247,22 +251,22 @@ check(
     out,
     [
         {
-            "output_pos": 101, "depth": 1,
+            "round": 0, "output_pos": 101, "depth": 1,
             "parent_node": 0, "parent_token": 100,
-            "outcome": "final_pruned", "token": 11,
+            "category": "final_pruned", "token": 11,
             "draft_rank": 1, "draft_prob": math.exp(-0.1),
             "ngram_order": 0, "ngram_rank": 0, "ngram_prob": 0.0,
         }
     ],
 )
 
-# 8) Summary counts.
+# 8) Summary counts (reads the unified "category" key).
 entries = [
-    {"outcome": "level_pruned"},
-    {"outcome": "final_pruned"},
-    {"outcome": "not_proposed"},
-    {"outcome": "not_proposed"},
-    {"outcome": "not_expanded"},
+    {"category": "level_pruned"},
+    {"category": "final_pruned"},
+    {"category": "not_proposed"},
+    {"category": "not_proposed"},
+    {"category": "not_expanded"},
 ]
 s = summary(entries)
 check(
@@ -281,18 +285,23 @@ check("summary empty", summary([]),
       {"total": 0.0, "not_proposed": 0.0, "level_pruned": 0.0,
        "final_pruned": 0.0, "not_expanded": 0.0, "frac_proposed": 0.0})
 
-# 9) CSV writer: exact column order per spec; token / parent_token are the
-#    DECODED token text, not the token ids; parent node id sits before its
-#    token.
-csv_entries = [
-    {"output_pos": 101, "depth": 1,
+# 9) Merged CSV writer: reject rows share the tree-table columns, carry the
+#    rejection reason in category, write "/" for the missing node id, and
+#    round is the first column.
+merged = [
+    {"round": 0, "output_pos": 101, "depth": 1,
      "parent_node": 0, "parent_token": 100,
-     "outcome": "level_pruned", "token": 12,
+     "category": "hit", "node": 1, "token": 11,
+     "draft_rank": 1, "draft_prob": 0.5,
+     "ngram_order": 3, "ngram_rank": 1, "ngram_prob": 0.9},
+    {"round": 0, "output_pos": 101, "depth": 1,
+     "parent_node": 0, "parent_token": 100,
+     "category": "level_pruned", "token": 12,
      "draft_rank": 2, "draft_prob": math.exp(-0.5),
      "ngram_order": 3, "ngram_rank": 2, "ngram_prob": 0.2},
-    {"output_pos": 102, "depth": 2,
+    {"round": 1, "output_pos": 102, "depth": 2,
      "parent_node": 1, "parent_token": 31,
-     "outcome": "not_proposed", "token": 99},
+     "category": "not_proposed", "token": 99},
 ]
 
 
@@ -303,20 +312,29 @@ class Tok:
 
 with tempfile.TemporaryDirectory() as tmp:
     p = Path(tmp) / "out.csv"
-    save(csv_entries, p, Tok())
+    save(merged, p, Tok())
     rows = list(csv.reader(p.open(encoding="utf-8", newline="")))
     assert rows[0] == [
-        "output_pos", "depth", "parent_node", "parent_token", "outcome",
-        "token",
+        "round", "output_pos", "depth", "parent_node", "parent_token",
+        "category", "node", "token",
         "draft_rank", "draft_prob", "ngram_order", "ngram_rank",
         "ngram_prob",
     ]
-    assert rows[1] == ["101", "1", "0", "<tok:100>", "level_pruned",
-                       "<tok:12>",
-                       "2", "0.606531", "3", "2", "0.2"]
-    assert rows[2] == ["102", "2", "1", "<tok:31>", "not_proposed",
-                       "<tok:99>",
-                       "0", "0", "0", "0", "0"]
-    assert len(rows) == 3
+    assert rows[1] == ["0", "101", "1", "0", "<tok:100>", "hit", "1",
+                       "<tok:11>", "1", "0.5", "3", "1", "0.9"]
+    # reject row: node = "/", category = rejection reason
+    assert rows[2] == ["0", "101", "1", "0", "<tok:100>", "level_pruned",
+                       "/", "<tok:12>", "2", "0.606531", "3", "2", "0.2"]
+    assert rows[3] == ["1", "102", "2", "1", "<tok:31>", "not_proposed",
+                       "/", "<tok:99>", "0", "0", "0", "0", "0"]
+    assert len(rows) == 4
+
+# 10) round propagates from the collector call into every entry.
+out = run(
+    next_token=12, accepted=[0], depths=[], vid_tokens=[100],
+    stats={"rank_pairs_detail": [L1()]}, round_index=9,
+)
+assert len(out) == 1 and out[0]["round"] == 9, out
+print("OK  round propagates")
 
 print("\nALL REJECTED-PROPOSALS CHECKS PASSED")

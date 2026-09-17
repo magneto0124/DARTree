@@ -59,9 +59,11 @@ def check(name, got, want):
         raise SystemExit(f"FAILED: {name}")
 
 
-def run(accepted, parents, depths, vid_tokens, stats, start=100):
+def run(accepted, parents, depths, vid_tokens, stats, start=100,
+        round_index=0):
     sink: list[dict[str, Any]] = []
     collect(
+        round_index=round_index,
         accepted_indices=accepted,
         parents=parents,
         node_depths=depths,
@@ -100,34 +102,35 @@ out = run(
     depths=[1, 1, 2, 2],
     vid_tokens=[100, 11, 12, 21, 22],
     stats={"rank_pairs_detail": list(LEVELS.values())},
+    round_index=3,
 )
 check(
     "fixed tree: hit + walked_past + unreached",
     out,
     [
         {
-            "output_pos": 101, "depth": 1,
+            "round": 3, "output_pos": 101, "depth": 1,
             "parent_node": 0, "parent_token": 100,
             "category": "hit", "node": 1, "token": 11,
             "draft_rank": 1, "draft_prob": math.exp(-0.1),
             "ngram_order": 3, "ngram_rank": 1, "ngram_prob": 0.5,
         },
         {
-            "output_pos": 101, "depth": 1,
+            "round": 3, "output_pos": 101, "depth": 1,
             "parent_node": 0, "parent_token": 100,
             "category": "walked_past", "node": 2, "token": 12,
             "draft_rank": 2, "draft_prob": math.exp(-0.5),
             "ngram_order": 3, "ngram_rank": 2, "ngram_prob": 0.2,
         },
         {
-            "output_pos": 102, "depth": 2,
+            "round": 3, "output_pos": 102, "depth": 2,
             "parent_node": 1, "parent_token": 11,
             "category": "walked_past", "node": 3, "token": 21,
             "draft_rank": 1, "draft_prob": math.exp(-0.2),
             "ngram_order": 3, "ngram_rank": 2, "ngram_prob": 0.3,
         },
         {
-            "output_pos": 102, "depth": 2,
+            "round": 3, "output_pos": 102, "depth": 2,
             "parent_node": 2, "parent_token": 12,
             "category": "unreached", "node": 4, "token": 22,
             "draft_rank": 1, "draft_prob": math.exp(-0.3),
@@ -150,14 +153,14 @@ check(
     out,
     [
         {
-            "output_pos": 101, "depth": 1,
+            "round": 0, "output_pos": 101, "depth": 1,
             "parent_node": 0, "parent_token": 100,
             "category": "walked_past", "node": 1, "token": 11,
             "draft_rank": 1, "draft_prob": math.exp(-0.1),
             "ngram_order": 3, "ngram_rank": 1, "ngram_prob": 0.5,
         },
         {
-            "output_pos": 101, "depth": 1,
+            "round": 0, "output_pos": 101, "depth": 1,
             "parent_node": 0, "parent_token": 100,
             "category": "walked_past", "node": 2, "token": 12,
             "draft_rank": 2, "draft_prob": math.exp(-0.5),
@@ -199,21 +202,21 @@ check(
     out,
     [
         {
-            "output_pos": 101, "depth": 1,
+            "round": 0, "output_pos": 101, "depth": 1,
             "parent_node": 0, "parent_token": 100,
             "category": "hit", "node": 1, "token": 31,
             "draft_rank": 1, "draft_prob": math.exp(-0.1),
             "ngram_order": 3, "ngram_rank": 1, "ngram_prob": 0.9,
         },
         {
-            "output_pos": 102, "depth": 2,
+            "round": 0, "output_pos": 102, "depth": 2,
             "parent_node": 1, "parent_token": 31,
             "category": "walked_past", "node": 2, "token": 51,
             "draft_rank": 1, "draft_prob": math.exp(-0.2),
             "ngram_order": 3, "ngram_rank": 1, "ngram_prob": 0.5,
         },
         {
-            "output_pos": 102, "depth": 2,
+            "round": 0, "output_pos": 102, "depth": 2,
             "parent_node": 1, "parent_token": 31,
             "category": "walked_past", "node": 3, "token": 52,
             "draft_rank": 2, "draft_prob": math.exp(-0.8),
@@ -235,7 +238,7 @@ check(
     out,
     [
         {
-            "output_pos": 101, "depth": 1,
+            "round": 0, "output_pos": 101, "depth": 1,
             "parent_node": 0, "parent_token": 100,
             "category": "walked_past", "node": 1, "token": 11,
             "draft_rank": 1, "draft_prob": math.exp(-0.1),
@@ -270,14 +273,15 @@ check("summary empty", summary([]),
        "frac_hit": 0.0})
 
 # CSV writer: exact column order per spec; token / parent_token are the
-# DECODED token text, not the token ids; node ids sit before their tokens.
+# DECODED token text, not the token ids; node ids sit before their tokens;
+# round is the first column.
 csv_entries = [
-    {"output_pos": 101, "depth": 1,
+    {"round": 2, "output_pos": 101, "depth": 1,
      "parent_node": 0, "parent_token": 100,
      "category": "hit", "node": 1, "token": 11,
      "draft_rank": 1, "draft_prob": 0.5,
      "ngram_order": 3, "ngram_rank": 1, "ngram_prob": 0.9},
-    {"output_pos": 101, "depth": 1,
+    {"round": 2, "output_pos": 101, "depth": 1,
      "parent_node": 0, "parent_token": 100,
      "category": "walked_past", "node": 2, "token": 12,
      "draft_rank": 2, "draft_prob": math.exp(-0.5),
@@ -295,16 +299,15 @@ with tempfile.TemporaryDirectory() as tmp:
     save(csv_entries, p, Tok())
     rows = list(csv.reader(p.open(encoding="utf-8", newline="")))
     assert rows[0] == [
-        "output_pos", "depth", "parent_node", "parent_token", "category",
-        "node", "token",
+        "round", "output_pos", "depth", "parent_node", "parent_token",
+        "category", "node", "token",
         "draft_rank", "draft_prob", "ngram_order", "ngram_rank",
         "ngram_prob",
     ]
-    assert rows[1] == ["101", "1", "0", "<tok:100>", "hit", "1", "<tok:11>",
-                       "1", "0.5", "3", "1", "0.9"]
-    assert rows[2] == ["101", "1", "0", "<tok:100>", "walked_past",
-                       "2", "<tok:12>",
-                       "2", "0.606531", "2", "2", "0.2"]
+    assert rows[1] == ["2", "101", "1", "0", "<tok:100>", "hit", "1",
+                       "<tok:11>", "1", "0.5", "3", "1", "0.9"]
+    assert rows[2] == ["2", "101", "1", "0", "<tok:100>", "walked_past",
+                       "2", "<tok:12>", "2", "0.606531", "2", "2", "0.2"]
     assert len(rows) == 3
     # with a png path: matplotlib missing -> scatter skipped, no crash
     save(csv_entries, p, Tok(), png_path=Path(tmp) / "scatter.png")
