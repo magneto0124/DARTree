@@ -134,8 +134,16 @@ def select_topb_prefix_tree(
     parents: list[int],
     scores: list[float],
     budget: int,
+    depths: list[int] | None = None,
 ) -> list[int]:
-    """Select global Top-B nodes when scores are prefix monotone."""
+    """Select global Top-B nodes when scores are prefix monotone.
+
+    The deepest Top-1 node (best score at the maximum depth) has its full
+    ancestor chain force-kept; the remaining budget is then filled with the
+    best-scoring nodes among the rest.  ``depths`` (optional, one entry per
+    node including the root) locates the deepest level; when omitted the
+    depth is derived by walking ``parents``.
+    """
     node_count = len(parents) - 1
     if node_count < 0 or len(scores) != len(parents):
         raise ValueError("parents and scores must include the root and have equal length")
@@ -154,10 +162,54 @@ def select_topb_prefix_tree(
                 f"{parent_index} with {scores[parent_index]}"
             )
 
-    selected = sorted(
-        range(1, node_count + 1),
+    if depths is None:
+        depths = [0] * (node_count + 1)
+        for node_index in range(1, node_count + 1):
+            depths[node_index] = depths[int(parents[node_index])] + 1
+    elif len(depths) != node_count + 1:
+        raise ValueError("depths must include the root and have equal length to parents")
+
+    if int(budget) == 0:
+        return []
+
+    # Force-keep the chain of the deepest Top-1 node: the highest-scoring
+    # node at the maximum depth plus every ancestor up to (and including)
+    # the root's children.  All nodes at the deepest level share the same
+    # depth, so ranking by score (already depth-bonus adjusted by callers)
+    # is unambiguous.
+    max_depth = max(int(depths[node_index]) for node_index in range(1, node_count + 1))
+    deepest_top1 = min(
+        (
+            node_index
+            for node_index in range(1, node_count + 1)
+            if int(depths[node_index]) == max_depth
+        ),
         key=lambda node_index: (-float(scores[node_index]), int(node_index)),
-    )[: int(budget)]
+    )
+    chain: list[int] = []
+    current = int(deepest_top1)
+    while current > 0:
+        chain.append(current)
+        current = int(parents[current])
+    chain_set = set(chain)
+
+    if len(chain) > int(budget):
+        # Budget cannot hold the whole chain; fall back to a plain score cut.
+        selected = sorted(
+            range(1, node_count + 1),
+            key=lambda node_index: (-float(scores[node_index]), int(node_index)),
+        )[: int(budget)]
+    else:
+        # Fill the remaining budget from the nodes outside the chain.
+        remaining = [
+            node_index
+            for node_index in range(1, node_count + 1)
+            if node_index not in chain_set
+        ]
+        remaining.sort(
+            key=lambda node_index: (-float(scores[node_index]), int(node_index))
+        )
+        selected = chain + remaining[: int(budget) - len(chain)]
     selected_set = {0, *selected}
     if any(int(parents[node_index]) not in selected_set for node_index in selected):
         raise RuntimeError("prefix-monotone Top-B selection produced a non-prefix-closed tree")
@@ -169,8 +221,15 @@ def select_topb_prefix_tree_tensor(
     depths: torch.Tensor,
     budget: int,
     depth_bonus: float,
+    parents: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Select global Top-B with one device topk and restore topological order."""
+    """Select global Top-B with one device topk and restore topological order.
+
+    When ``parents`` (root at index 0, ``-1`` parent for the root) is given,
+    the chain of the deepest Top-1 node is force-kept and the remaining
+    budget is filled from the rest (see select_topb_prefix_tree); without it
+    a plain score cut is used.
+    """
     node_count = int(depths.numel())
     if int(path_scores.numel()) < node_count + 1:
         raise ValueError("path_scores must include the root and every candidate node")
@@ -183,13 +242,50 @@ def select_topb_prefix_tree_tensor(
         path_scores[1 : node_count + 1].float()
         + float(depth_bonus) * depths[:node_count].float()
     )
-    selected = torch.topk(
-        candidate_scores,
-        k=int(budget),
+
+    def plain_topk() -> torch.Tensor:
+        selected = torch.topk(
+            candidate_scores,
+            k=int(budget),
+            largest=True,
+            sorted=False,
+        ).indices
+        return torch.sort(selected.add_(1)).values
+
+    if parents is None:
+        return plain_topk()
+
+    parents = parents[: node_count + 1]
+    node_depths = depths[:node_count]
+    # Force-keep the chain of the deepest Top-1 node: highest-scoring node
+    # at the maximum depth plus every ancestor (old node ids, root excluded).
+    max_depth = int(node_depths.max().item())
+    deepest_positions = torch.nonzero(node_depths == max_depth).flatten()
+    top1_position = int(
+        deepest_positions[candidate_scores[deepest_positions].argmax()].item()
+    )
+    chain_positions: list[int] = []
+    current = top1_position + 1  # old node id of the deepest Top-1
+    while current > 0:
+        chain_positions.append(current - 1)
+        current = int(parents[current].item())
+    if len(chain_positions) > int(budget):
+        return plain_topk()
+    chain_t = torch.tensor(
+        sorted(chain_positions), dtype=torch.long, device=depths.device
+    )
+    # Fill the remaining budget from the nodes outside the chain.
+    all_positions = torch.arange(node_count, dtype=torch.long, device=depths.device)
+    remaining_mask = ~torch.isin(all_positions, chain_t)
+    remaining_positions = torch.nonzero(remaining_mask).flatten()
+    remaining_top = torch.topk(
+        candidate_scores[remaining_positions],
+        k=int(budget) - len(chain_positions),
         largest=True,
         sorted=False,
     ).indices
-    return torch.sort(selected.add_(1)).values
+    selected_positions = torch.cat((chain_t, remaining_positions[remaining_top]))
+    return torch.sort(selected_positions).values.add_(1)
 
 
 def prepare_tree_attention_inputs(
@@ -1071,6 +1167,7 @@ def build_dartree_supertree(
                 depths_t[:node_count],
                 int(budget),
                 float(depth_bonus),
+                parents_t,
             )
             selected_parent_old_t = parents_t[kept_old_indices_t]
             selected_token_t = tokens_t[kept_old_indices_t - 1]
@@ -1144,6 +1241,7 @@ def build_dartree_supertree(
                 all_parents,
                 prune_scores,
                 int(budget),
+                all_depths,
             )
         if record_rank_pairs:
             # new node i <-> old node kept_old_indices_list[i - 1]; used to
