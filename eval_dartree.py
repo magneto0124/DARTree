@@ -997,7 +997,7 @@ def build_dartree_supertree(
                     0, flat_child_ids
                 ).view(parent_count, int(top_ids.shape[1]), -1)
                 logit_par = parent_base + torch.einsum(
-                    "pm,pmc->pc", mid_ps.float(), f2_ps.float()
+                    "pm,pem->pe", mid_ps.float(), f2_ps.float()
                 )
                 if correction_scorer.fc2_bias is not None:
                     logit_par = logit_par + correction_scorer.fc2_bias.index_select(
