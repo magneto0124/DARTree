@@ -995,7 +995,7 @@ def build_dartree_supertree(
                 ).squeeze(1)
                 f2_ps = correction_scorer.fc2_weight.index_select(
                     0, flat_child_ids
-                ).view(parent_count, -1, -1)
+                ).view(parent_count, int(top_ids.shape[1]), -1)
                 logit_par = parent_base + torch.einsum(
                     "pm,pmc->pc", mid_ps.float(), f2_ps.float()
                 )
