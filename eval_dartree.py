@@ -51,6 +51,13 @@ STAGE_NAMES = ("draft", "tree_build", "tree_setup", "verify", "commit")
 # distribution.  s'(c) = log(λ·p(c|p) + (1-λ)·p(c|g)); λ = 1 disables it.
 NNT_MIX_LAMBDA = 0.5
 
+# Parent-distribution (soft positional prior) correction: mixture weight for
+# blending the child position's own corrected distribution p_d(x) with the
+# direct parent's distribution p_{d-1}(x) evaluated on the same token x:
+#   p'(x) = log(λ·p_d(x) + (1-λ)·p_{d-1}(x))
+# λ = 1 disables it (pure child distribution).
+PARENT_DIST_MIX_LAMBDA = 1.0
+
 
 def stage_dict() -> dict[str, float]:
     return {name: 0.0 for name in STAGE_NAMES}
@@ -284,7 +291,11 @@ def _collect_tree_table(
     """Record every node of the pruned (final) tree, one row per node, with
     its category and its draft / ngram statistics within the parent's
     candidate row (ranks count strictly-better candidates, 1 = best; ties
-    share a rank):
+    share a rank).  ``draft_rank`` is the rank of the node's token in the
+    parent's pure correction-head distribution; ``parent_rank`` is the rank
+    in the final distribution the parent actually sampled its children from
+    (after the parent-dist and NNT corrections); both answer "what top-k
+    was this token in the parent's word distribution".
 
       - ``hit``: on the accepted chain (``accepted_indices[1:]``);
       - ``walked_past``: child of an accepted node that the verification
@@ -341,6 +352,17 @@ def _collect_tree_table(
         draft_rank = 1 + sum(
             1 for v in draft_logprobs if v > draft_logprobs[cand_pos]
         )
+        final_logprobs = rec.get("final_logprobs")
+        parent_rank = (
+            1
+            + sum(
+                1
+                for v in final_logprobs[row]
+                if v > final_logprobs[row][cand_pos]
+            )
+            if final_logprobs is not None
+            else 0
+        )
         ngram_rank = (
             1 + sum(1 for v in ngram_probs if v > ngram_probs[cand_pos])
             if ngram_probs is not None
@@ -364,6 +386,7 @@ def _collect_tree_table(
                 "token": token_id,
                 "draft_rank": int(draft_rank),
                 "draft_prob": float(np.exp(draft_logprobs[cand_pos])),
+                "parent_rank": int(parent_rank),
                 "ngram_order": int(ngram_order),
                 "ngram_rank": int(ngram_rank),
                 "ngram_prob": (
@@ -389,7 +412,9 @@ def _collect_rejected_proposals(
     """Record, for the round's rejected fallback token, whether it was ever
     PROPOSED for the rejecting parent -- i.e. appeared in that parent's
     top-k candidate row -- and which pruning step removed it before
-    verification.
+    verification.  When proposed, ``draft_rank`` / ``parent_rank`` give the
+    position of the rejected token in the parent's pure correction-head /
+    final sampled distribution (top-1 = best).
 
     ``next_token`` is the target's own prediction at the slot of the last
     accepted node (``accepted_indices[-1]``); by construction it is not
@@ -463,6 +488,17 @@ def _collect_rejected_proposals(
     draft_rank = 1 + sum(
         1 for v in draft_logprobs if v > draft_logprobs[cand_pos]
     )
+    final_logprobs = rec.get("final_logprobs")
+    parent_rank = (
+        1
+        + sum(
+            1
+            for v in final_logprobs[row]
+            if v > final_logprobs[row][cand_pos]
+        )
+        if final_logprobs is not None
+        else 0
+    )
     ngram_rank = (
         1 + sum(1 for v in ngram_probs if v > ngram_probs[cand_pos])
         if ngram_probs is not None
@@ -479,6 +515,7 @@ def _collect_rejected_proposals(
             "category": outcome,
             "draft_rank": int(draft_rank),
             "draft_prob": float(np.exp(draft_logprobs[cand_pos])),
+            "parent_rank": int(parent_rank),
             "ngram_order": int(ngram_order),
             "ngram_rank": int(ngram_rank),
             "ngram_prob": (
@@ -646,6 +683,7 @@ def build_dartree_supertree(
     supertree_width: int,
     depth_bonus: float,
     nnt_lambda: float = NNT_MIX_LAMBDA,
+    parent_dist_lambda: float = PARENT_DIST_MIX_LAMBDA,
     correction_scorer: DominoCorrectionScorer,
     z_parts: torch.Tensor,
     candidate_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None],
@@ -912,59 +950,80 @@ def build_dartree_supertree(
                 }
             )
 
-        # NNT correction (next-next-token view): re-score the parent's top-k
-        # candidates under the GRANDPARENT's context -- from the grandparent,
-        # the current child token is the next-next token -- then blend the two
-        # conditional probabilities in probability space:
-        #   s'(c) = log(λ·p(c|p) + (1-λ)·p(c|g)),  λ = nnt_lambda
-        # p(c|p) is the parent-refined score computed above; p(c|g) is the
-        # same candidate table scored with the grandparent hidden state.
-        # Grandparent scores are computed once per unique grandparent and
-        # gathered (siblings share a grandparent).  Skipped at depth 1 (no
-        # grandparent) and on the base-logits path (slot < prefix_len), where
-        # both views are identical so the blend would be a no-op.
-        if child_depth >= 2 and slot >= prefix_len:
-            cids, cbase, cw, cbias = candidate_tables
-            cids_slot = cids[slot]
-            table_size = int(cids_slot.numel())
-            grandparent_indices = parents_t[parent_indices]
-            unique_g, inverse = torch.unique(
-                grandparent_indices, return_inverse=True
-            )
-            g_hidden = hidden_states.index_select(0, unique_g)
-            z_g = z_parts[:, slot : slot + 1, :].expand(
-                int(unique_g.numel()), -1, -1
-            )[:, 0, :]
-            bias_g = None if cbias is None else cbias[slot]
-            full_vals_g, _, log_z_g = (
-                correction_scorer.candidate_topk_from_precomputed(
-                    z_g,
-                    g_hidden,
-                    cids_slot,
-                    cbase[slot],
-                    cw[slot],
-                    bias_g,
-                    table_size,
-                    sort_result=False,
-                    compute_log_z=True,
+        # Parent-distribution correction (soft positional prior): the direct
+        # parent's own distribution -- the one it was sampled from -- is
+        # evaluated on THIS slot's candidate tokens and blended into the
+        # child distribution in probability space:
+        #   s'(x) = log(λ·p_d(x) + (1-λ)·p_{d-1}(x)),  λ = parent_dist_lambda
+        # where p_d(x) is the child's corrected log-prob of token x (from the
+        # pure correction head above, renormalized over this candidate
+        # support) and p_{d-1}(x) is the parent's distribution mass on the
+        # SAME token x -- its pure correction-head softmax evaluated at the
+        # child's candidates (or the base-logits softmax when the parent sat
+        # on the pure-draft prefix path).  The parent distribution is only
+        # stored over the parent's own candidate table, so we re-evaluate the
+        # correction head on the child's support; that matches the ideal
+        # full-vocab read-off up to a per-parent normalizing constant, which
+        # is absorbed by renormalizing both blend terms over the same
+        # candidate support (a proper mixture).  The child is thus pulled
+        # toward tokens the parent position also favoured.  Skipped at depth
+        # 1 (the round root has no in-tree distribution) and on the
+        # base-logits path (slot < prefix_len), mirroring the NNT gate.
+        t_parent_dist = detail_start(detail_times, device)
+        if (
+            slot >= prefix_len
+            and child_depth >= 2
+            and 0.0 <= float(parent_dist_lambda) < 1.0
+        ):
+            ps = slot - 1
+            flat_child_ids = top_ids.reshape(-1)
+            parent_base = (
+                base_logits[0, ps].float().index_select(0, flat_child_ids)
+            ).view(parent_count, -1)
+            if ps >= prefix_len:
+                # Parent was on the corrected path: evaluate its pure
+                # correction head (base + fc2·SiLU(z[ps] + w_s·h_p)) on the
+                # child's candidate tokens.
+                z_ps = z_parts[:, ps : ps + 1, :].expand(
+                    parent_count, -1, -1
+                )[:, 0, :]
+                s_ps = F.linear(
+                    parent_hidden_2d, correction_scorer.w_s, None
                 )
+                mid_ps = correction_scorer.middle(
+                    (z_ps + s_ps).unsqueeze(1)
+                ).squeeze(1)
+                f2_ps = correction_scorer.fc2_weight.index_select(
+                    0, flat_child_ids
+                ).view(parent_count, -1, -1)
+                logit_par = parent_base + torch.einsum(
+                    "pm,pmc->pc", mid_ps.float(), f2_ps.float()
+                )
+                if correction_scorer.fc2_bias is not None:
+                    logit_par = logit_par + correction_scorer.fc2_bias.index_select(
+                        0, flat_child_ids
+                    ).view(parent_count, -1)
+            else:
+                # Parent sat on the pure-draft prefix: the distribution it
+                # used at sampling time is the base-logits softmax.
+                logit_par = parent_base
+            log_p_par = torch.log_softmax(logit_par.float(), dim=-1)
+            log_p_d = top_scores - torch.logsumexp(
+                top_scores, dim=-1, keepdim=True
             )
-            # Full-table log-probs of every candidate token per unique
-            # grandparent (table order); align the parent's top-k tokens to
-            # their table positions via searchsorted on the negated
-            # (descending) candidate-id table.
-            log_p_g_full = full_vals_g.float() - log_z_g.float()
-            table_pos = torch.searchsorted(-cids_slot, -top_ids)
-            log_p_g = torch.gather(
-                log_p_g_full.index_select(0, inverse),
-                1,
-                table_pos,
-            )
-            blend_max = torch.maximum(top_scores, log_p_g)
+            blend_max = torch.maximum(log_p_d, log_p_par)
             top_scores = blend_max + torch.log(
-                float(nnt_lambda) * torch.exp(top_scores - blend_max)
-                + (1.0 - float(nnt_lambda)) * torch.exp(log_p_g - blend_max)
+                float(parent_dist_lambda)
+                * torch.exp(log_p_d - blend_max)
+                + (1.0 - float(parent_dist_lambda))
+                * torch.exp(log_p_par - blend_max)
             )
+        add_elapsed(
+            detail_times,
+            "tree_parent_dist",
+            t_parent_dist,
+            device,
+        )
 
         # DART-style continuity-aware scoring (Algorithm 1 / App. D):
         #   score += w_level * (w_logit * s_logit + w_ngram * s_ngram)
@@ -977,55 +1036,65 @@ def build_dartree_supertree(
         # This is the full-window 3-gram implementation (window length comes
         # from the loaded trie's order; the C++ model degrades to a shorter
         # match when a longer context is unseen).
-        if ngram_model is not None and ngram_weight > 0:
-            level = child_depth - 1
-            w_level = (float(level) + 1.0) ** -0.7
-            w_logit = 0.9 ** float(level)
-            ngram_ctx = _ngram_contexts(
-                child_depth=child_depth,
-                parent_indices=parent_indices,
-                tokens_t=tokens_t,
-                parents_t=parents_t,
-                root_token_id=root_token_id,
-                prev_root_token_id=prev_root_token_id,
-                order=int(ngram_model.order),
+        # if ngram_model is not None and ngram_weight > 0:
+        #     level = child_depth - 1
+        #     w_level = (float(level) + 1.0) ** -0.7
+        #     w_logit = 0.9 ** float(level)
+        #     ngram_ctx = _ngram_contexts(
+        #         child_depth=child_depth,
+        #         parent_indices=parent_indices,
+        #         tokens_t=tokens_t,
+        #         parents_t=parents_t,
+        #         root_token_id=root_token_id,
+        #         prev_root_token_id=prev_root_token_id,
+        #         order=int(ngram_model.order),
+        #     )
+        #     cand_ids = top_ids.cpu().tolist()
+        #     ngram_rows = []
+        #     matched_rows: list[list[int]] = []
+        #     for ctx, cands in zip(ngram_ctx, cand_ids):
+        #         probs, matched = ngram_model.get_probability(ctx, list(cands))
+        #         ngram_rows.append([float(p) for p in probs])
+        #         # matched length per candidate: 2 = trigram context hit,
+        #         # 1 = bigram backoff, 0 = no match (probability 0)
+        #         matched_rows.append([int(m) for m in matched])
+        #     p_ng = torch.tensor(ngram_rows, dtype=top_scores.dtype, device=top_scores.device,)
+        #     # Order-aware correction: scale every probability by the ratio of
+        #     # the ngram order that produced it (ratio[0] = no match,
+        #     # ratio[2] = bigram, ratio[3] = trigram) so mixed-order scores
+        #     # stay comparable.
+        #     p_ng = p_ng * torch.tensor(
+        #         [
+        #             [
+        #                 ratio[max(int(m), 0)]
+        #                 for m in row
+        #             ]
+        #             for row in matched_rows
+        #         ],
+        #         dtype=p_ng.dtype,
+        #         device=p_ng.device,
+        #     )
+        #     if renorm_ngram:
+        #         # renormalize over the candidate set so the ngram term fuses
+        #         # with the draft term as a conditional distribution over the
+        #         # same support (see _renormalize_ngram_rows)
+        #         p_ng = _renormalize_ngram_rows(p_ng, ngram_eps)
+        #     s_ng = torch.log(p_ng + ngram_eps)
+        #     if record_rank_pairs:
+        #         rank_levels[-1]["ngram_probs"] = p_ng.detach().cpu().tolist()
+        #         rank_levels[-1]["contexts"] = ngram_ctx
+        #         rank_levels[-1]["ngram_matched"] = matched_rows
+        #     top_scores = w_level * (w_logit * top_scores + ngram_weight * s_ng)
+
+        if record_rank_pairs:
+            # Final per-level scores actually used for selection (after the
+            # parent-dist and NNT corrections; the ngram block is currently
+            # disabled), aligned to ``cands`` -- this is the distribution the
+            # parent's children were sampled from.  Ranks computed against it
+            # answer "what top-k was this token in the parent's distribution".
+            rank_levels[-1]["final_logprobs"] = (
+                top_scores.detach().cpu().tolist()
             )
-            cand_ids = top_ids.cpu().tolist()
-            ngram_rows = []
-            matched_rows: list[list[int]] = []
-            for ctx, cands in zip(ngram_ctx, cand_ids):
-                probs, matched = ngram_model.get_probability(ctx, list(cands))
-                ngram_rows.append([float(p) for p in probs])
-                # matched length per candidate: 2 = trigram context hit,
-                # 1 = bigram backoff, 0 = no match (probability 0)
-                matched_rows.append([int(m) for m in matched])
-            p_ng = torch.tensor(ngram_rows, dtype=top_scores.dtype, device=top_scores.device,)
-            # Order-aware correction: scale every probability by the ratio of
-            # the ngram order that produced it (ratio[0] = no match,
-            # ratio[2] = bigram, ratio[3] = trigram) so mixed-order scores
-            # stay comparable.
-            p_ng = p_ng * torch.tensor(
-                [
-                    [
-                        ratio[max(int(m), 0)]
-                        for m in row
-                    ]
-                    for row in matched_rows
-                ],
-                dtype=p_ng.dtype,
-                device=p_ng.device,
-            )
-            if renorm_ngram:
-                # renormalize over the candidate set so the ngram term fuses
-                # with the draft term as a conditional distribution over the
-                # same support (see _renormalize_ngram_rows)
-                p_ng = _renormalize_ngram_rows(p_ng, ngram_eps)
-            s_ng = torch.log(p_ng + ngram_eps)
-            if record_rank_pairs:
-                rank_levels[-1]["ngram_probs"] = p_ng.detach().cpu().tolist()
-                rank_levels[-1]["contexts"] = ngram_ctx
-                rank_levels[-1]["ngram_matched"] = matched_rows
-            top_scores = w_level * (w_logit * top_scores + ngram_weight * s_ng)
 
         t_select = detail_start(detail_times, device)
         scored_candidate_count = int(top_scores.shape[1])
@@ -1335,6 +1404,7 @@ def dartree_generate(
     ngram_model: Any | None = None,
     ngram_weight: float = 0.0,
     nnt_lambda: float = NNT_MIX_LAMBDA,
+    parent_dist_lambda: float = PARENT_DIST_MIX_LAMBDA,
     record_round_trace: bool = False,
     record_entropy: bool = False,
     record_rank_pairs: bool = False,
@@ -1621,6 +1691,7 @@ def dartree_generate(
             supertree_width=supertree_width,
             depth_bonus=depth_bonus,
             nnt_lambda=nnt_lambda,
+            parent_dist_lambda=parent_dist_lambda,
             correction_scorer=correction_scorer,
             z_parts=z_parts,
             candidate_tables=candidate_tables,
@@ -2015,12 +2086,16 @@ def save_tree_table(
     ``walked_past`` / ``unreached``), node id + token (decoded text), and
     the token's draft / ngram statistics within the parent's candidate row
     (ngram_order: 0 = no match, 2 = bigram, 3 = trigram; ranks are
-    1-based, 1 = best).  Rejected rows carry the same columns but the
-    category is the rejection reason (``not_proposed`` / ``level_pruned`` /
-    ``final_pruned`` / ``not_expanded``) and ``node`` is ``/`` (the token
-    is not a node of the final tree).  When ``png_path`` is given, a
-    scatter of the accepted (hit) tokens' (draft rank, ngram rank) pairs
-    with the y = x diagonal is also written (matplotlib optional)."""
+    1-based, 1 = best).  ``draft_rank`` ranks the token in the parent's
+    pure correction-head distribution; ``parent_rank`` ranks it in the
+    final distribution the parent actually sampled from (after the
+    parent-dist / NNT corrections).  Rejected rows carry the same columns
+    but the category is the rejection reason (``not_proposed`` /
+    ``level_pruned`` / ``final_pruned`` / ``not_expanded``) and ``node``
+    is ``/`` (the token is not a node of the final tree).  When
+    ``png_path`` is given, a scatter of the accepted (hit) tokens'
+    (draft rank, ngram rank) pairs with the y = x diagonal is also
+    written (matplotlib optional)."""
     with csv_path.open("w", newline="", encoding="utf-8") as file:
         writer = csv.writer(file)
         writer.writerow(
@@ -2035,6 +2110,7 @@ def save_tree_table(
                 "token",
                 "draft_rank",
                 "draft_prob",
+                "parent_rank",
                 "ngram_order",
                 "ngram_rank",
                 "ngram_prob",
@@ -2067,6 +2143,7 @@ def save_tree_table(
                     ),
                     int(e.get("draft_rank", 0)),
                     f"{float(e.get('draft_prob', 0.0)):.6g}",
+                    int(e.get("parent_rank", 0)),
                     int(e.get("ngram_order", 0)),
                     int(e.get("ngram_rank", 0)),
                     f"{float(e.get('ngram_prob', 0.0)):.6g}",
@@ -2147,20 +2224,45 @@ def rejected_proposal_summary(
 
 
 def tree_table_summary(entries: list[dict[str, Any]]) -> dict[str, float]:
-    """Count final-tree nodes by category and the accepted-token share."""
+    """Count final-tree nodes by category, the accepted-token share, and
+    the parent-distribution ranks (top-1 = best) of the accepted tokens and
+    of the proposed-but-rejected fallback tokens."""
     n = len(entries)
     counts: dict[str, float] = {
         "hit": 0.0,
         "walked_past": 0.0,
         "unreached": 0.0,
     }
+    hit_ranks: list[float] = []
+    rejected_ranks: list[float] = []
     for e in entries:
         category = str(e.get("category", "unreached"))
         counts[category] = counts.get(category, 0.0) + 1.0
+        rank = int(e.get("parent_rank", 0))
+        if category == "hit" and rank > 0:
+            hit_ranks.append(float(rank))
+        elif category in ("level_pruned", "final_pruned") and rank > 0:
+            rejected_ranks.append(float(rank))
+
+    def _rank_stats(values: list[float]) -> tuple[float, float]:
+        if not values:
+            return (0.0, 0.0)
+        ordered = sorted(values)
+        return (
+            float(np.mean(values)),
+            float(ordered[len(ordered) // 2]),
+        )
+
+    hit_mean, hit_median = _rank_stats(hit_ranks)
+    reject_mean, reject_median = _rank_stats(rejected_ranks)
     return {
         "total": float(n),
         **counts,
         "frac_hit": (counts["hit"] / float(n)) if n else 0.0,
+        "hit_parent_rank_mean": hit_mean,
+        "hit_parent_rank_median": hit_median,
+        "rejected_parent_rank_mean": reject_mean,
+        "rejected_parent_rank_median": reject_median,
     }
 
 
@@ -2315,6 +2417,17 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--parent-dist-lambda", type=float, default=PARENT_DIST_MIX_LAMBDA,
+        help=(
+            "Parent-distribution (soft positional prior) mixture weight in "
+            "[0, 1]: s'(x) = log(λ·p_d(x) + (1-λ)·p_{d-1}(x)), where p_d is "
+            "the child position's corrected distribution and p_{d-1} is the "
+            "direct parent's distribution evaluated on the same candidate "
+            "token x. 1 disables the correction (default: "
+            + str(PARENT_DIST_MIX_LAMBDA) + ")."
+        ),
+    )
+    parser.add_argument(
         "--ngram-model", type=str, default=None,
         help=(
             "Path to a DART-format .trie n-gram model, loaded via "
@@ -2406,6 +2519,10 @@ def validate_contract(args: argparse.Namespace) -> None:
     if not 0.0 <= float(args.nnt_lambda) <= 1.0:
         raise ValueError(
             "--nnt-lambda must be within [0, 1]"
+        )
+    if not 0.0 <= float(args.parent_dist_lambda) <= 1.0:
+        raise ValueError(
+            "--parent-dist-lambda must be within [0, 1]"
         )
     if int(args.candidate_vocab_size) < int(args.expansion_k):
         raise ValueError(
@@ -2638,6 +2755,7 @@ def main() -> None:
                 ngram_model=ngram_model,
                 ngram_weight=args.ngram_weight,
                 nnt_lambda=args.nnt_lambda,
+                parent_dist_lambda=args.parent_dist_lambda,
                 record_round_trace=(
                     args.record_round_trace
                 ),

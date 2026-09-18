@@ -44,6 +44,16 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--parent-dist-lambda", type=float, default=None,
+        help=(
+            "Parent-distribution (soft positional prior) mixture weight in "
+            "[0, 1]; defaults to eval_dartree's PARENT_DIST_MIX_LAMBDA "
+            "(1.0 = disabled). s'(x) = log(λ·p_d(x) + (1-λ)·p_{d-1}(x)) "
+            "blends the child position's corrected distribution with the "
+            "direct parent's distribution evaluated on the same token."
+        ),
+    )
+    parser.add_argument(
         "--renorm-ngram", action="store_true",
         help=(
             "Renormalize each parent's ngram candidate probabilities over "
@@ -63,20 +73,30 @@ def main() -> None:
     parser.add_argument(
         "--record-rank-pairs", action="store_true",
         help=(
-            "Record the (draft top-k rank, ngram top-k rank) of every accepted "
-            "draft-chain token and write a CSV + first-quadrant scatter PNG "
-            "(with the y=x diagonal) next to --output. "
-            "Requires --ngram-weight > 0."
+            "Record, for every tree node and the round's rejected fallback "
+            "token, the 1-based rank in the parent's pure correction-head "
+            "distribution (draft_rank) and in the final distribution actually "
+            "used for sampling (parent_rank), then write a CSV next to "
+            "--output."
         ),
     )
     args = parser.parse_args()
 
-    from eval_dartree import NNT_MIX_LAMBDA, main as evaluate
+    from eval_dartree import (
+        NNT_MIX_LAMBDA,
+        PARENT_DIST_MIX_LAMBDA,
+        main as evaluate,
+    )
 
     nnt_lambda = (
         float(args.nnt_lambda)
         if args.nnt_lambda is not None
         else NNT_MIX_LAMBDA
+    )
+    parent_dist_lambda = (
+        float(args.parent_dist_lambda)
+        if args.parent_dist_lambda is not None
+        else PARENT_DIST_MIX_LAMBDA
     )
 
     max_samples = (
@@ -106,6 +126,7 @@ def main() -> None:
         "--device", args.device,
         "--ngram-weight", str(args.ngram_weight),
         "--nnt-lambda", str(nnt_lambda),
+        "--parent-dist-lambda", str(parent_dist_lambda),
         "--output", output,
     ]
     if args.ngram_model:
