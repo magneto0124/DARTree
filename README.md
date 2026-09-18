@@ -90,6 +90,11 @@ python run_dartree.py \
 * `--ngram-weight` sets the weight of the n-gram term; `0.5` is DART's
   default, `0` disables it (ablation baseline). When `> 0`, `--ngram-model`
   is required.
+* `--update-ngram` (optional) enables online adaptation: after each round's
+  verification, the target-accepted token segment (lookback token + accepted
+  chain + next token) is fed back into the loaded `.trie` in memory, so
+  later rounds score against updated counts. The trie is only mutated in
+  memory and is never saved to disk, so the on-disk model is untouched.
 * The C++ extension is JIT-compiled on first use via
   `torch.utils.cpp_extension.load` (requires a C++20 compiler with OpenMP on
   the host) and is then cached under `~/.cache/torch_extensions`.

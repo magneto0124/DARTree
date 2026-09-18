@@ -43,6 +43,16 @@ def main() -> None:
             "eval_dartree.py --renorm-ngram)."
         ),
     )
+    parser.add_argument(
+        "--update-ngram", action="store_true",
+        help=(
+            "Online n-gram adaptation: feed each round's target-verified "
+            "tokens (lookback + accepted chain + next token) back into the "
+            "loaded n-gram trie in memory so later rounds score against "
+            "updated counts. The trie is never saved to disk. Requires "
+            "--ngram-model and --ngram-weight > 0."
+        ),
+    )
     parser.add_argument("--output")
     parser.add_argument("--record-round-trace", action="store_true")
     parser.add_argument(
@@ -112,6 +122,8 @@ def main() -> None:
         engine_args.append("--record-rank-pairs")
     if args.renorm_ngram:
         engine_args.append("--renorm-ngram")
+    if args.update_ngram:
+        engine_args.append("--update-ngram")
 
     sys.argv = engine_args
     evaluate()

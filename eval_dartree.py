@@ -1277,6 +1277,7 @@ def dartree_generate(
     record_entropy: bool = False,
     record_rank_pairs: bool = False,
     renorm_ngram: bool = False,
+    update_ngram: bool = False,
     verify_buffer_nodes: int = 0,
 ) -> SimpleNamespace:
     if input_ids.ndim != 2 or input_ids.shape[0] != 1:
@@ -1685,6 +1686,23 @@ def dartree_generate(
             t_commit_tensor,
             device,
         )
+
+        if update_ngram and ngram_model is not None:
+            # Online n-gram adaptation: feed this round's target-verified
+            # token segment -- one lookback token (the token before the round
+            # root, so the trie windows start from the real context tail),
+            # the accepted chain, and the target's own next token -- back
+            # into the in-memory n-gram trie.  The next round's continuity
+            # scoring (build_dartree_supertree) then sees updated counts.
+            # The trie is only mutated in memory and never saved to disk.
+            ngram_model.add_conversation(
+                [int(prev_round_root_token_id)]
+                + accepted_tokens.reshape(-1)
+                .detach()
+                .cpu()
+                .tolist()
+                + [int(next_token)]
+            )
 
         t_commit_cache = detail_start(detail_times, device)
         compact_dynamic_cache(
@@ -2274,6 +2292,17 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--update-ngram", action="store_true",
+        help=(
+            "Online n-gram adaptation: after each round's verification, feed "
+            "the target-accepted token segment (lookback + accepted chain + "
+            "next token) back into the loaded n-gram trie in memory, so "
+            "later rounds score against updated counts. The trie is only "
+            "mutated in memory and is never saved to disk. Requires "
+            "--ngram-weight > 0 and --ngram-model."
+        ),
+    )
+    parser.add_argument(
         "--temperature", type=float, default=0.0
     )
     parser.add_argument("--device", default="cuda:0")
@@ -2567,6 +2596,7 @@ def main() -> None:
                 record_entropy=args.record_entropy,
                 record_rank_pairs=args.record_rank_pairs,
                 renorm_ngram=args.renorm_ngram,
+                update_ngram=args.update_ngram,
                 verify_buffer_nodes=(
                     1 + int(args.tree_budget)
                 ),
