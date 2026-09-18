@@ -5,9 +5,17 @@ an object exposing :class:`NgramModel`.  The concrete implementation is
 :class:`CppTrieNgram`, which wraps DART's C++ ``TrieNgram`` extension
 (``utils/ngram_cpp``): it is binary-compatible with DART's ``.trie`` files, so
 models published for DART (e.g. ``fvliang/dart-qwen3-ngram`` with
-``full.trie`` / ``small.trie``) load as-is.  :class:`NoopNgram` remains as an
-all-zero fallback for callers that want to exercise the scoring path without a
-model.
+``full.trie`` / ``small.trie``) load as-is.
+
+Loaded models are mutable in memory: :meth:`NgramModel.add_conversation` and
+:meth:`NgramModel.add_all` incrementally insert new n-grams into an
+already-loaded trie at runtime (extending existing paths and creating new
+ones), and :meth:`NgramModel.save` persists the updated table back to DART
+``.trie`` format.
+
+When no n-gram model is available the scorer simply receives ``None`` and
+skips the n-gram term entirely (see ``eval_dartree.build_dartree_supertree``);
+there is no placeholder model.
 """
 from __future__ import annotations
 
@@ -50,6 +58,33 @@ class NgramModel(ABC):
         epsilon before taking the log, exactly like DART's
         ``logf(score + 1e-10f)``.
         """
+        raise NotImplementedError
+
+    @abstractmethod
+    def add_conversation(self, tokens: Sequence[int]) -> None:
+        """Incrementally add every n-gram window of ``tokens`` to the model.
+
+        Mirrors ``TrieNgram::add_conversation``: for each start position a
+        slice of up to ``order`` tokens is inserted as a sequence, creating
+        new trie paths and bumping the frequencies of existing ones.  Safe to
+        call at any time on an already-loaded model (runtime update) as long
+        as it is not concurrent with :meth:`get_probability` on the same
+        object.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def add_all(self, other: "NgramModel") -> None:
+        """Merge another model's trie into this one (frequencies summed).
+
+        Equivalent to DART's ``TrieNgram::add_all`` (used to fold partial
+        models together); both tries must share the same ``order``.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def save(self, path: str) -> None:
+        """Persist the current trie to ``path`` in DART ``.trie`` format."""
         raise NotImplementedError
 
 
@@ -95,21 +130,16 @@ class CppTrieNgram(NgramModel):
         )
         return [float(p) for p in probs], [int(m) for m in matched_lengths]
 
+    def add_conversation(self, tokens: Sequence[int]) -> None:
+        self._model.add_conversation(list(tokens))
 
-class NoopNgram(NgramModel):
-    """Placeholder contributing nothing (all-zero probabilities).
+    def add_all(self, other: "NgramModel") -> None:
+        if not isinstance(other, CppTrieNgram):
+            raise TypeError(
+                "add_all requires another CppTrieNgram-backed model; "
+                f"got {type(other).__name__}"
+            )
+        self._model.add_all(other._model)
 
-    Since every candidate of a parent receives the same constant score
-    offset, the ranking (and therefore the selected tree) is unchanged; the
-    logit-only score remains the effective criterion.
-    """
-
-    order = 2
-
-    def get_probability(
-        self,
-        context: Sequence[int],
-        tokens: Sequence[int],
-    ) -> tuple[list[float], list[int]]:
-        del context  # unused placeholder
-        return [0.0] * len(tokens), [0] * len(tokens)
+    def save(self, path: str) -> None:
+        self._model.save(path)

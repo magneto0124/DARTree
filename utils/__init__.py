@@ -6,7 +6,7 @@ from .draft_model import (
     logits_entropy,
     sample,
 )
-from .ngram import CppTrieNgram, NgramModel, NoopNgram
+from .ngram import CppTrieNgram, NgramModel
 
 __all__ = [
     "CppTrieNgram",
@@ -14,7 +14,6 @@ __all__ = [
     "DominoCorrectionScorer",
     "DraftCorrectionGraphRunner",
     "NgramModel",
-    "NoopNgram",
     "cuda_time",
     "load_and_process_dataset",
     "logits_entropy",

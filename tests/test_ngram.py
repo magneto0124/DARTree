@@ -1,8 +1,8 @@
 """Tests for the DART-style n-gram model interface (utils/ngram.py).
 
-The pure-Python tests (NoopNgram contract, reference-trie semantics vs an
-independent counter-based n-gram model) run anywhere.  Tests exercising the
-C++ ``TrieNgram`` extension are skipped when torch / a C++20 compiler is not
+The pure-Python tests (reference-trie semantics vs an independent
+counter-based n-gram model) run anywhere.  Tests exercising the C++
+``TrieNgram`` extension are skipped when torch / a C++20 compiler is not
 available (e.g. on a host without the build toolchain); they should be run on
 the target evaluation machine (Linux, torch + gcc).
 """
@@ -15,7 +15,7 @@ from collections import Counter, defaultdict
 
 import pytest
 
-from utils.ngram import NgramModel, NoopNgram
+from utils.ngram import CppTrieNgram, NgramModel
 
 
 # ============================================================================
@@ -111,14 +111,6 @@ def _counter_probability(
 # ============================================================================
 # Pure-Python tests (run everywhere)
 # ============================================================================
-
-def test_noop_ngram_contract() -> None:
-    model = NoopNgram()
-    assert model.order == 2
-    probs, matched = model.get_probability([1, 2], [3, 4, 5])
-    assert probs == [0.0, 0.0, 0.0]
-    assert matched == [0, 0, 0]
-
 
 @pytest.mark.parametrize("order", [2, 3])
 @pytest.mark.parametrize(
@@ -229,3 +221,87 @@ def test_cpp_trie_ngram_interface() -> None:
         wrapped = loaded.get_probability([2], [1, 2, 3])
         assert wrapped[0] == pytest.approx([float(p) for p in direct[0]], abs=1e-6)
         assert wrapped[1] == [int(m) for m in direct[1]]
+
+
+def test_cpp_wrapper_dynamic_update() -> None:
+    """add_conversation / add_all / save on an already-loaded model.
+
+    Exercises the runtime-update path exactly as the eval loop would: load a
+    persisted .trie, insert new n-grams, observe new probabilities, persist
+    the updated table, and reload it.
+    """
+    pytest.importorskip("torch")
+    try:
+        from utils.ngram_cpp import load_cpp_ngram
+    except Exception as exc:  # pragma: no cover
+        pytest.skip(f"C++ n-gram extension unavailable: {exc}")
+
+    from utils.ngram import CppTrieNgram
+
+    cpp = load_cpp_ngram()
+    with tempfile.TemporaryDirectory() as tmp:
+        base_path = os.path.join(tmp, "base.trie")
+        base = cpp.TrieNgram(2)
+        base.add_conversation([1, 2, 1, 2])
+        base.save(base_path)
+
+        model = CppTrieNgram.from_path(base_path)
+        # before update: P(3 | [1]) is OOV
+        assert model.get_probability([1], [3]) == ([0.0], [0])
+
+        # runtime add: [1, 2, 1, 2] gave node 1 freq 2; [1, 3, 1, 3] adds
+        # two 1->3 edges -> node 1 freq 4, so P(3 | [1]) = 2/4 = 0.5
+        model.add_conversation([1, 3, 1, 3])
+        probs, matched = model.get_probability([1], [3])
+        assert probs == pytest.approx([0.5], abs=1e-6)
+        assert matched == [1]
+
+        # merge another model: [1, 4] once -> node 1 freq +1, child 4 freq 1
+        other = CppTrieNgram(cpp.TrieNgram(2))
+        other.add_conversation([1, 4])
+        model.add_all(other)
+        probs, matched = model.get_probability([1], [2, 3, 4])
+        # node 1 freq 5; children 2 (2), 3 (2), 4 (1)
+        assert probs == pytest.approx([0.4, 0.4, 0.2], abs=1e-6)
+        assert matched == [1, 1, 1]
+
+        # the update persists and survives a reload
+        updated_path = os.path.join(tmp, "updated.trie")
+        model.save(updated_path)
+        reloaded = CppTrieNgram.from_path(updated_path)
+        probs, matched = reloaded.get_probability([1], [2, 3, 4])
+        assert probs == pytest.approx([0.4, 0.4, 0.2], abs=1e-6)
+        assert matched == [1, 1, 1]
+
+
+def test_cpp_add_all_requires_cpp_backing() -> None:
+    """add_all must reject models without a C++ trie backing."""
+    pytest.importorskip("torch")
+    try:
+        from utils.ngram_cpp import load_cpp_ngram
+    except Exception as exc:  # pragma: no cover
+        pytest.skip(f"C++ n-gram extension unavailable: {exc}")
+
+    from utils.ngram import CppTrieNgram
+
+    class _NonCppNgram(NgramModel):
+        """An NgramModel implementation with no C++ trie backing."""
+
+        order = 3
+
+        def get_probability(self, context, tokens):
+            raise NotImplementedError
+
+        def add_conversation(self, tokens):
+            raise NotImplementedError
+
+        def add_all(self, other):
+            raise NotImplementedError
+
+        def save(self, path):
+            raise NotImplementedError
+
+    cpp = load_cpp_ngram()
+    model = CppTrieNgram(cpp.TrieNgram(2))
+    with pytest.raises(TypeError):
+        model.add_all(_NonCppNgram())
