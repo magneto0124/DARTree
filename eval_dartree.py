@@ -976,38 +976,68 @@ def build_dartree_supertree(
             and 0.0 <= float(parent_dist_lambda) < 1.0
         ):
             ps = slot - 1
-            flat_child_ids = top_ids.reshape(-1)
-            parent_base = (
-                base_logits[0, ps].float().index_select(0, flat_child_ids)
-            ).view(parent_count, -1)
+            cids, _cbase, cw, cbias = candidate_tables
+            cids_slot = cids[slot]
+            table_size = int(cids_slot.numel())
+            # p_{d-1}: the parent's own distribution, evaluated on THIS
+            # slot's shared candidate table with the same correction-head
+            # call as the per-level scoring above -- two inputs change: the
+            # BASE is taken at the parent slot ps, and the hidden state is
+            # the GRANDPARENT's (the parent's distribution was sampled with
+            # the chain ending at its own parent).  fc2 rows depend only on
+            # the token id, so the child slot's gathered rows are reused.
+            # The full-table log-probs are then aligned back to each
+            # parent's own top-k order via searchsorted (mirroring the NNT
+            # alignment).
+            parent_base_table = (
+                base_logits[0, ps].float().index_select(0, cids_slot)
+            )
             if ps >= prefix_len:
-                # Parent was on the corrected path: evaluate its pure
-                # correction head (base + fc2·SiLU(z[ps] + w_s·h_p)) on the
-                # child's candidate tokens.
+                # Parent was on the corrected path: its pure correction head
+                # (base + fc2·SiLU(z[ps] + w_s·h_g)), conditioned on the
+                # GRANDPARENT's GRU state -- the parent's distribution was
+                # sampled at level ps with the chain ending at its own parent
+                # (the grandparent of the current child), so the hidden state
+                # differs from the p_d call above, not just the base.
                 z_ps = z_parts[:, ps : ps + 1, :].expand(
                     parent_count, -1, -1
                 )[:, 0, :]
-                s_ps = F.linear(
-                    parent_hidden_2d, correction_scorer.w_s, None
+                grandparent_indices = parents_t[parent_indices]
+                g_hidden = hidden_states.index_select(
+                    0, grandparent_indices
                 )
-                mid_ps = correction_scorer.middle(
-                    (z_ps + s_ps).unsqueeze(1)
-                ).squeeze(1)
-                f2_ps = correction_scorer.fc2_weight.index_select(
-                    0, flat_child_ids
-                ).view(parent_count, int(top_ids.shape[1]), -1)
-                logit_par = parent_base + torch.einsum(
-                    "pm,pem->pe", mid_ps.float(), f2_ps.float()
+                bias_ps = None if cbias is None else cbias[slot]
+                full_vals_par, _, log_z_par = (
+                    correction_scorer.candidate_topk_from_precomputed(
+                        z_ps,
+                        g_hidden,
+                        cids_slot,
+                        parent_base_table,
+                        cw[slot],
+                        bias_ps,
+                        table_size,
+                        sort_result=False,
+                        compute_log_z=True,
+                    )
                 )
-                if correction_scorer.fc2_bias is not None:
-                    logit_par = logit_par + correction_scorer.fc2_bias.index_select(
-                        0, flat_child_ids
-                    ).view(parent_count, -1)
+                log_p_par_full = full_vals_par.float() - log_z_par.float()
             else:
                 # Parent sat on the pure-draft prefix: the distribution it
-                # used at sampling time is the base-logits softmax.
-                logit_par = parent_base
-            log_p_par = torch.log_softmax(logit_par.float(), dim=-1)
+                # used at sampling time is the base-logits softmax at ps.
+                log_p_par_full = torch.log_softmax(
+                    parent_base_table.view(1, -1)
+                    .expand(parent_count, -1)
+                    .float(),
+                    dim=-1,
+                )
+            # Align to the parent's own top-k candidates (top_ids are always
+            # a subset of the shared table on the corrected path) and
+            # renormalize both blend terms over that support.
+            table_pos = torch.searchsorted(-cids_slot, -top_ids)
+            log_p_par = torch.gather(log_p_par_full, 1, table_pos)
+            log_p_par = log_p_par - torch.logsumexp(
+                log_p_par, dim=-1, keepdim=True
+            )
             log_p_d = top_scores - torch.logsumexp(
                 top_scores, dim=-1, keepdim=True
             )
