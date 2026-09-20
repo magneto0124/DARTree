@@ -11,12 +11,21 @@ an existing DART ``.trie`` model, and the newly built data is merged ON TOP
 of it (frequencies summed; the base model is counted exactly once) before
 saving.  The base model's order must match ``--ngram-order``.
 
+With ``--eval-output JSON`` the build additionally folds in the complete
+input+output texts of a saved eval run (run_dartree.py output): inputs are
+read from the dataset (replicating the eval run's shuffle/select via the
+JSON's own ``summary.config``), outputs from the saved rows
+(``dartree.text`` matched by ``sample_index`` / ``turn_index``), and every
+sample's conversation text is added to the n-gram model.  No model inference
+is run.
+
 Data sources:
   * a directory of JSONL files, each line ``{"text": ...}`` (DART format), or
   * a DARTree dataset name understood by ``utils.data.load_and_process_dataset``
     (gsm8k, math500, aime25, alpaca, mt-bench, humaneval, mbpp, livecodebench);
     the dataset is detected automatically: existing directories are treated as
-    JSONL, anything else as a dataset name.
+    JSONL, anything else as a dataset name,
+  * plus (optionally) a saved eval output JSON via ``--eval-output``.
 
 Usage::
 
@@ -27,6 +36,11 @@ Usage::
     python utils/ngram_build.py --data /path/to/more_jsonl \
         --output-path /path/to/out --ngram-order 3 --n-jobs 16 \
         --init-ngram /path/to/existing/3gram.trie
+
+    # additionally fold saved eval input+output texts into the build
+    python utils/ngram_build.py --data /path/to/jsonl_dir \
+        --output-path /path/to/out --ngram-order 3 --n-jobs 16 \
+        --eval-output results/gsm8k_pruned_t0.json
 """
 
 from __future__ import annotations
@@ -36,7 +50,7 @@ import json
 import os
 import struct
 from multiprocessing import Process
-from typing import List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence
 
 from tqdm import tqdm
 
@@ -89,6 +103,19 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--eval-output",
+        type=str,
+        default=None,
+        help=(
+            "Optional path to a saved eval output JSON (run_dartree.py "
+            "output). When given, the complete input+output conversation "
+            "texts of every sample are additionally read -- inputs from the "
+            "dataset (order replicated from the JSON's summary.config), "
+            "outputs from the saved rows -- and added to the n-gram model. "
+            "No model inference is run."
+        ),
+    )
+    parser.add_argument(
         "--n-jobs",
         type=int,
         default=DEFAULT_N_JOBS,
@@ -137,6 +164,112 @@ def collect_items(data: str) -> List[str]:
     for row in dataset:
         turns = row.get("turns", [])
         texts.append("\n".join(str(t) for t in turns) if turns else "")
+    return texts
+
+
+# ============================================================================
+# Eval-output collection (no inference)
+# ============================================================================
+
+def group_assistant_by_sample(
+    rows: List[dict],
+) -> Dict[int, Dict[int, str]]:
+    """Map ``sample_index -> {turn_index: saved DARTree response text}``.
+
+    Rows without a usable ``dartree.text`` are dropped.
+    """
+    out: Dict[int, Dict[int, str]] = {}
+    for row in rows:
+        resp = row.get("dartree") or {}
+        text = resp.get("text")
+        if not isinstance(text, str) or not text:
+            continue
+        sidx = int(row.get("sample_index", -1))
+        tidx = int(row.get("turn_index", 0))
+        out.setdefault(sidx, {})[tidx] = text
+    return out
+
+
+def build_conversation_text(
+    user_turns: List[str],
+    assistant_by_turn: Dict[int, str],
+) -> str:
+    """Join a sample's user turns with its saved assistant responses.
+
+    Interleaves by turn index (u0, a0, u1, a1, ...); any assistant responses
+    beyond the number of user turns are appended at the end.  Empty parts
+    are dropped; the parts are joined with newlines, matching the
+    conversation-text convention used by the dataset mode.
+    """
+    parts: List[str] = []
+    num_turns = len(user_turns)
+    for t in range(num_turns):
+        if user_turns[t]:
+            parts.append(user_turns[t])
+        assistant = assistant_by_turn.get(t)
+        if assistant:
+            parts.append(assistant)
+    for t in sorted(t for t in assistant_by_turn if t >= num_turns):
+        if assistant_by_turn[t]:
+            parts.append(assistant_by_turn[t])
+    return "\n".join(parts)
+
+
+def collect_eval_texts(args: argparse.Namespace) -> List[str]:
+    """Full input+output conversation texts from a saved eval output JSON.
+
+    Inputs come from the dataset (the eval run's shuffle/select is
+    replicated from the JSON's own ``summary.config`` so ``sample_index``
+    matches), outputs from the saved rows (``dartree.text`` matched by
+    ``sample_index`` / ``turn_index``).  No model inference is run.
+    """
+    with open(args.eval_output, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    rows = data.get("rows", [])
+    config = (data.get("summary") or {}).get("config") or {}
+
+    dataset_name = config.get("dataset")
+    if not dataset_name:
+        raise ValueError(
+            f"--eval-output {args.eval_output!r} has no summary.config.dataset; "
+            "cannot reconstruct the eval inputs"
+        )
+    shuffle_seed = int(config.get("dataset_shuffle_seed", 0))
+    max_samples = config.get("max_samples")
+
+    from utils.data import load_and_process_dataset
+
+    dataset = load_and_process_dataset(dataset_name)
+    if max_samples is not None:
+        count = max(0, int(max_samples))
+        if len(dataset) > count:
+            dataset = dataset.shuffle(seed=int(shuffle_seed))
+        dataset = dataset.select(range(min(len(dataset), count)))
+
+    assistant_by_sample = group_assistant_by_sample(rows)
+    texts: List[str] = []
+    missing = 0
+    for sample_index, assistant_by_turn in sorted(
+        assistant_by_sample.items()
+    ):
+        try:
+            user_turns = [str(t) for t in dataset[sample_index]["turns"]]
+        except (IndexError, KeyError) as exc:
+            print(
+                f"[warn] sample_index {sample_index} not found in dataset "
+                f"(order mismatch?): {exc}"
+            )
+            missing += 1
+            continue
+        conversation = build_conversation_text(
+            user_turns, assistant_by_turn
+        )
+        if conversation:
+            texts.append(conversation)
+    print(
+        f"[eval-output] {args.eval_output}: {len(texts)} conversations "
+        f"({missing} samples missing in dataset)"
+    )
     return texts
 
 
@@ -305,6 +438,10 @@ def main() -> None:
     os.makedirs(args.output_path, exist_ok=True)
 
     items = collect_items(args.data)
+    if args.eval_output:
+        # fold the saved eval input+output texts in as extra items; workers
+        # treat non-file items as conversation texts (see build_ngram_partition)
+        items = items + collect_eval_texts(args)
     if not items:
         raise RuntimeError(f"No training items found for --data {args.data!r}")
     print(f"Found {len(items)} training items.")

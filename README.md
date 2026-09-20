@@ -111,3 +111,16 @@ python run_dartree.py \
   merged on top of that model (frequencies summed, base counted once) and
   saved as `{output-path}/{ngram-order}gram.trie`. The base model's order
   must match `--ngram-order`.
+* To additionally fold **saved eval outputs** into the build — complete
+  input+output texts, no re-run of inference — pass
+  `--eval-output results/gsm8k_pruned_t0.json`: inputs are read from the
+  dataset (order replicated from the JSON's own `summary.config`), outputs
+  from the saved rows (`dartree.text` matched by `sample_index` /
+  `turn_index`), and every sample's conversation text is added like any
+  other training item:
+
+  ```bash
+  python utils/ngram_build.py --data /path/to/jsonl_dir \
+    --output-path /path/to/out --ngram-order 3 --n-jobs 16 \
+    --eval-output results/gsm8k_pruned_t0.json
+  ```
