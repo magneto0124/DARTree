@@ -105,3 +105,9 @@ python run_dartree.py \
   python utils/ngram_build.py --data /path/to/jsonl_dir \
     --output-path /path/to/out --ngram-order 3 --n-jobs 16
   ```
+
+  To **update** an existing model with new data instead of building from
+  scratch, pass `--init-ngram /path/to/existing/3gram.trie`: the new data is
+  merged on top of that model (frequencies summed, base counted once) and
+  saved as `{output-path}/{ngram-order}gram.trie`. The base model's order
+  must match `--ngram-order`.

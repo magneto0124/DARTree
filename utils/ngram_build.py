@@ -6,6 +6,11 @@ processes a strided partition of the input items, saves a partial model
 (``{order}gram-part{id}.trie``), and a final merge step folds the partials
 together with ``add_all`` into ``{order}gram.trie``.
 
+With ``--init-ngram PATH`` the build becomes an *update*: ``PATH`` points at
+an existing DART ``.trie`` model, and the newly built data is merged ON TOP
+of it (frequencies summed; the base model is counted exactly once) before
+saving.  The base model's order must match ``--ngram-order``.
+
 Data sources:
   * a directory of JSONL files, each line ``{"text": ...}`` (DART format), or
   * a DARTree dataset name understood by ``utils.data.load_and_process_dataset``
@@ -17,6 +22,11 @@ Usage::
 
     python utils/ngram_build.py --data /path/to/jsonl_dir \
         --output-path /path/to/out --ngram-order 3 --n-jobs 16
+
+    # update an existing model instead of building from scratch
+    python utils/ngram_build.py --data /path/to/more_jsonl \
+        --output-path /path/to/out --ngram-order 3 --n-jobs 16 \
+        --init-ngram /path/to/existing/3gram.trie
 """
 
 from __future__ import annotations
@@ -24,8 +34,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import struct
 from multiprocessing import Process
-from typing import List, Sequence
+from typing import List, Optional, Sequence
 
 from tqdm import tqdm
 
@@ -64,6 +75,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_NGRAM_ORDER,
         help=f"Order of the n-gram model. (default: {DEFAULT_NGRAM_ORDER})",
+    )
+    parser.add_argument(
+        "--init-ngram",
+        type=str,
+        default=None,
+        help=(
+            "Optional path to an existing DART .trie model to UPDATE "
+            "instead of building from scratch: the newly built data is "
+            "merged on top of this model (frequencies summed, base counted "
+            "once) and the result is saved as {order}gram.trie. The base "
+            "model's order must match --ngram-order."
+        ),
     )
     parser.add_argument(
         "--n-jobs",
@@ -203,19 +226,49 @@ def _process_text(
 # N-gram Merging
 # ============================================================================
 
-def merge_partial_models(args: argparse.Namespace, partial_files: Sequence[str]) -> None:
-    """Merge partial models into a single model, then clean up partials."""
+def read_trie_order(path: str) -> int:
+    """Read only the ``order`` header of a DART ``.trie`` file.
+
+    The binary layout starts with ``[order: size_t][node_count: size_t]``
+    (little-endian, 64-bit), so the order is available without loading the
+    whole model -- used to fail fast when ``--init-ngram`` mismatches
+    ``--ngram-order``.
+    """
+    with open(path, "rb") as f:
+        return struct.unpack("<Q", f.read(struct.calcsize("<Q")))[0]
+
+
+def merge_partial_models(
+    args: argparse.Namespace,
+    partial_files: Sequence[str],
+    init_path: Optional[str] = None,
+) -> None:
+    """Merge partial models into a single model, then clean up partials.
+
+    Without ``init_path`` the first partial file seeds the merged model and
+    the rest are folded in (build-from-scratch).  With ``init_path`` the
+    existing model at that path is the base (counted exactly once) and EVERY
+    partial file is new data folded on top of it (update mode).
+    """
     if not partial_files:
         print("No partial files found to merge.")
         return
 
     from utils.ngram_cpp import load_cpp_ngram
 
-    print(f"Merging {len(partial_files)} partial models...")
+    if init_path:
+        print(f"Updating existing n-gram model: {init_path}")
+    else:
+        print(f"Merging {len(partial_files)} partial models...")
     cpp_ngram = load_cpp_ngram()
-    merged_model = cpp_ngram.TrieNgram.load(partial_files[0])
+    if init_path:
+        merged_model = cpp_ngram.TrieNgram.load(init_path)
+        to_add = list(partial_files)
+    else:
+        merged_model = cpp_ngram.TrieNgram.load(partial_files[0])
+        to_add = list(partial_files[1:])
 
-    for partial_file in tqdm(partial_files[1:], desc="Merging"):
+    for partial_file in tqdm(to_add, desc="Merging"):
         partial_model = cpp_ngram.TrieNgram.load(partial_file)
         merged_model.add_all(partial_model)
         del partial_model  # Free memory
@@ -236,6 +289,18 @@ def merge_partial_models(args: argparse.Namespace, partial_files: Sequence[str])
 def main() -> None:
     """Main entry point for n-gram model building."""
     args = parse_args()
+
+    if args.init_ngram:
+        init_order = read_trie_order(args.init_ngram)
+        if init_order != args.ngram_order:
+            raise ValueError(
+                f"--init-ngram {args.init_ngram!r} has order {init_order} "
+                f"but --ngram-order is {args.ngram_order}; they must match"
+            )
+        print(
+            f"[ngram] will update existing model {args.init_ngram} "
+            f"(order={init_order})"
+        )
 
     os.makedirs(args.output_path, exist_ok=True)
 
@@ -260,7 +325,7 @@ def main() -> None:
         os.path.join(args.output_path, f"{args.ngram_order}gram-part{i}.trie")
         for i in range(args.n_jobs)
     ]
-    merge_partial_models(args, partial_files)
+    merge_partial_models(args, partial_files, init_path=args.init_ngram)
 
     print("Done!")
 
