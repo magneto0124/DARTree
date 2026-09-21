@@ -38,6 +38,24 @@ from utils.device_backend import (
     synchronize,
 )
 
+# LogitGram: online gram built from the target model's own logits (prompt
+# prefill + accepted rounds). Lives in the DART tree-search package; fall
+# back to a repo-local file import when `dart` is not installed on sys.path.
+try:
+    from dart.tree_search.logit_gram import LogitGram
+except ImportError:
+    import importlib.util
+    import sys as _sys
+
+    _lg_spec = importlib.util.spec_from_file_location(
+        "logit_gram",
+        REPO_ROOT / "DART" / "dart" / "tree_search" / "logit_gram.py",
+    )
+    _lg_module = importlib.util.module_from_spec(_lg_spec)
+    _sys.modules["logit_gram"] = _lg_module
+    _lg_spec.loader.exec_module(_lg_module)
+    LogitGram = _lg_module.LogitGram
+
 
 REPO_ROOT = Path(__file__).resolve().parent
 
@@ -1326,6 +1344,15 @@ def dartree_generate(
     # Target entropy (nats) at each accepted draft-chain node, DARTree path.
     entropy_target: list[float] = []
 
+    # Online gram built from the target model's own word distributions:
+    # updated once after prompt prefill and after every accepted round, and
+    # later used to correct draft-tree candidates (top_k kept per key).
+    logit_gram = LogitGram(
+        top_k=64,
+        vocab_size=int(target.config.vocab_size),
+        device=device,
+    )
+
     hidden_collector = SelectedHiddenCollector(
         target, draft_model.target_layer_ids
     )
@@ -1337,13 +1364,18 @@ def dartree_generate(
         position_ids=position_ids[:, :num_input_tokens],
         past_key_values=past_key_values_target,
         use_cache=True,
-        logits_to_keep=1,
+        # Keep logits for every prompt position: the online gram is updated
+        # with each prompt token's next-token distribution below.
+        logits_to_keep=num_input_tokens,
         output_hidden_states=False,
     )
     output_ids[:, :num_input_tokens] = input_ids
     output_ids[
         :, num_input_tokens : num_input_tokens + 1
-    ] = sample(output.logits, temperature)
+    ] = sample(output.logits[:, -1:, :], temperature)
+    # Prefill update: for every prompt position i, key = input_ids[i],
+    # value = softmax top-k of logits[i] (the distribution of token i+1).
+    logit_gram.update_from_logits_batch(input_ids[0], output.logits[0])
     target_hidden = hidden_collector.cat()
     time_to_first_token = cuda_time(device) - prefill_start
 
@@ -1645,6 +1677,15 @@ def dartree_generate(
 
         acceptance_lengths.append(accepted_len)
         start += accepted_len
+        # Decode update: for each accepted chain token k (root .. last draft
+        # node), key = accepted token, value = verify logits at the node's own
+        # slot (the distribution the target used to predict its successor in
+        # the chain, i.e. the next accepted token or the rejected sample).
+        if accepted_len > 0:
+            logit_gram.update_from_logits_batch(
+                accepted_tokens[0],
+                output.logits[:, accepted_index_tensor, :][0],
+            )
         commit_elapsed = cuda_time(device) - commit_start
         stage_times["commit"] += commit_elapsed
         round_total_elapsed_ms = float(
